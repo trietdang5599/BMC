@@ -1,24 +1,34 @@
-tokenizer: roberta-large
-plm: roberta-large
-lm_size: 1024
-per_device_train_batch_size: 4
-per_device_eval_batch_size: 4
-max_sequence_length: 512
+tokenizer: gpt2
+plm: gpt2
+lm_size: 768
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+max_sequence_length: 256
 cached_dir: "cache/TRIP/"
 weight_decay: 0.01
 learning_rate: 0.00005
-num_warmup_steps: 3000
-gradient_accumulation_steps: 1
-num_train_epochs: 1
+num_warmup_steps: 0
+gradient_accumulation_steps: 8
+num_train_epochs: 3
 dropout: 0.1
 max_grad_norm: 5
-run_sft: true
+run_sft: false
 run_rlt: true
 run_online_eval: true
 run_offline_eval: false
-num_train_rl_epochs: 10
-sampled_times: 100
+num_train_rl_epochs: 3
+sampled_times: 10
 rl_learning_rate: 0.000001
 uniform_weights: false
 max_gen_tokens: 50
-
+special_tokens_dict:
+  pad_token: "<pad>"
+  cls_token: "<cls>"
+  sep_token: "<sep>"
+  additional_special_tokens:
+    - "[PERSUADER]"
+    - "[PERSUADEE]"
+    - "[PATH]"
+    - "[SEP]"
+    - "[CONTEXT]"
+    - "[GOAL]"
