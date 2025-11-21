@@ -1,0 +1,7 @@
+.env
+data
+wandb
+venv
+__pycache__/
+cache
+logs
