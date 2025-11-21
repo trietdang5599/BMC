@@ -23,15 +23,23 @@ from transformers import get_linear_schedule_with_warmup
 from transformers.trainer_utils import IntervalStrategy
 
 try:
+    # Some TRL installs can raise RuntimeError if optional deps (e.g., openai) are missing.
     from trl import DPOConfig, DPOTrainer
-except ImportError:  # pragma: no cover
+except Exception:  # pragma: no cover
     DPOConfig = None
     DPOTrainer = None
 
 from base.trainer import Trainer
 
-from bayes_adaptive_llm.data_processor import BayesDataProcessorForEmotionalSupport, BayesDataProcessorForNegotiation, \
-    BayesDataProcessorForPersuation
+from bayes_adaptive_llm.data_processor import (
+    BayesDataProcessorForEmotionalSupport,
+    BayesDataProcessorForNegotiation,
+    BayesDataProcessorForPersuation,
+    BayesTorchDatasetForEmotionalSupport,
+    BayesTorchDatasetForNegotiation,
+    BayesTorchDatasetForPersuation,
+    BayesTorchDatasetForRecommendation,
+)
 from config.constants import RECOMMENDATION, NEGOTIATION, EMOTIONAL_SUPPORT, SL_RATIO, SUCCESS_RATE, AVG_TURN, FAIRNESS, \
     TOXICITY, ITEM_FREQ, USER_REWARD, PERSUATION, P4G_GOAL2DESCRIPTION, NEGOTIATION_GOAL2DESCRIPTION, ES_CONV_GOAL2DESCRIPTION, \
     P4G_GOAL2DESCRIPTION
@@ -102,7 +110,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
         Build task-specific datasets and dataloaders.
         """
         if self.game_config.name == RECOMMENDATION:
-            torch_dataset = BayesDataProcessorForPersuation(
+            torch_dataset = BayesTorchDatasetForRecommendation(
                 tokenizer=self.tokenizer,
                 instances=data_instances,
                 goal2id=goal2id,
@@ -112,7 +120,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
             )
         # negotiation scenario
         elif self.game_config.name == NEGOTIATION:
-            torch_dataset = BayesDataProcessorForNegotiation(
+            torch_dataset = BayesTorchDatasetForNegotiation(
                 tokenizer=self.tokenizer,
                 instances=data_instances,
                 goal2id=goal2id,
@@ -122,7 +130,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
             )
         # emotional support conversation
         elif self.game_config.name == EMOTIONAL_SUPPORT:
-            torch_dataset = BayesDataProcessorForEmotionalSupport(
+            torch_dataset = BayesTorchDatasetForEmotionalSupport(
                 tokenizer=self.tokenizer,
                 instances=data_instances,
                 goal2id=goal2id,
@@ -132,7 +140,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
             )
         # persuasion conversations
         elif self.game_config.name == PERSUATION:
-            torch_dataset = BayesDataProcessorForPersuation(
+            torch_dataset = BayesTorchDatasetForPersuation(
                     tokenizer=self.tokenizer,
                     instances=data_instances,
                     goal2id=goal2id,
@@ -164,6 +172,11 @@ class BayesAdaptiveLLMTrainer(Trainer):
         method that create the optimizer to train the model
         :return: a torch.optim.Optimizer
         """
+        # Ensure lr is numeric even if accidentally loaded as string from yaml/cli.
+        try:
+            lr_value = float(learning_rate)
+        except Exception:
+            lr_value = 1e-5
         modules = [model]
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
@@ -178,7 +191,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
                 "weight_decay": 0.0,
             },
         ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate)
+        optimizer = AdamW(optimizer_grouped_parameters, lr=lr_value)
         return optimizer
 
     def create_scheduler(self, optimizer, num_warmup_steps, max_train_steps):

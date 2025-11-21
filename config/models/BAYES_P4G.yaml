@@ -1,0 +1,58 @@
+###
+# Bayes-Adaptive LLM config for persuasion (P4G).
+# Designed to run SFT on the P4G dataset and then DPO on preference pairs.
+###
+
+# Backbone
+tokenizer: roberta-large
+plm: roberta-large
+lm_size: 1024
+cached_dir: "cache/BAYES/"
+dropout: 0.1
+combined_action: false
+
+# Training toggles
+run_sft: true
+run_preference_search: false   # MCTS preference search handled separately
+run_dpo: true
+run_offline_eval: false
+run_online_eval: false
+
+# SFT hyperparameters
+batch_size: 4
+gradient_accumulation: 2
+learning_rate: 5e-5
+warmup_ratio: 0.05
+weight_decay: 0.01
+num_train_epochs: 3
+logging_steps: 10
+save_total_limit: 2
+max_grad_norm: 1.0
+max_sequence_length: 512
+
+# DPO-specific
+dpo_beta: 0.1
+max_length: 512
+max_prompt_length: 512
+fp16: false
+bf16: false
+gradient_checkpointing: false
+# Path to preference pairs (jsonl) used for DPO; dataset/loader should read this.
+preference_pairs_path: "data/preference_pairs_gpt-3.5-turbo.jsonl"
+
+# Generation
+temperature: 0.7
+max_gen_tokens: 64
+
+# Special tokens for persuasion (same as TRIP/PPDPP PG)
+special_tokens_dict:
+  pad_token: "<pad>"
+  cls_token: "<cls>"
+  sep_token: "<sep>"
+  additional_special_tokens:
+    - "[PERSUADER]"
+    - "[PERSUADEE]"
+    - "[PATH]"
+    - "[SEP]"
+    - "[CONTEXT]"
+    - "[GOAL]"
