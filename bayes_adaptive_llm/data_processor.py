@@ -19,11 +19,6 @@ from base.torch_dataset import BaseTorchDataset
 from config.constants import PERSUADEE_TOKEN, PERSUADER_TOKEN, GOAL_TOKEN, SEP_TOKEN, PATH_TOKEN, CONTEXT_TOKEN
 
 
-def generate_bins(low: float, high: float, n_bins: int):
-    """
-    Placeholder helper mirroring TRIP's bin generator (used in negotiation tasks).
-    """
-    raise NotImplementedError("Bin generation is not implemented.")
 
 
 class BayesDataProcessorForRecommendation(DataProcessorForRecommendation):

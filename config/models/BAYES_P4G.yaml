@@ -3,10 +3,10 @@
 # Designed to run SFT on the P4G dataset and then DPO on preference pairs.
 ###
 
-# Backbone
-tokenizer: roberta-large
-plm: roberta-large
-lm_size: 1024
+# Backbone (reduced for 8GB GPU)
+tokenizer: roberta-base
+plm: roberta-base
+lm_size: 768
 cached_dir: "cache/BAYES/"
 dropout: 0.1
 combined_action: false
@@ -18,25 +18,25 @@ run_dpo: true
 run_offline_eval: false
 run_online_eval: false
 
-# SFT hyperparameters
-batch_size: 4
-gradient_accumulation: 2
-learning_rate: 5e-5
+# SFT hyperparameters (memory-friendly)
+batch_size: 1
+gradient_accumulation: 4
+learning_rate: 3e-5
 warmup_ratio: 0.05
 weight_decay: 0.01
 num_train_epochs: 3
 logging_steps: 10
 save_total_limit: 2
 max_grad_norm: 1.0
-max_sequence_length: 512
+max_sequence_length: 256
 
 # DPO-specific
 dpo_beta: 0.1
-max_length: 512
-max_prompt_length: 512
-fp16: false
+max_length: 256
+max_prompt_length: 256
+fp16: true
 bf16: false
-gradient_checkpointing: false
+gradient_checkpointing: true
 # Path to preference pairs (jsonl) used for DPO; dataset/loader should read this.
 preference_pairs_path: "data/preference_pairs_gpt-3.5-turbo.jsonl"
 

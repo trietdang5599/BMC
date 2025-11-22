@@ -54,24 +54,6 @@ def cuda_bf16_supported() -> bool:
         return False
     return major >= 8
 
-def calculate_gae(values: torch.Tensor,
-                  rewards: torch.Tensor,
-                  dones: torch.Tensor,
-                  next_values: torch.Tensor,
-                  gamma: float,
-                  lambd: float) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Placeholder for generalized advantage estimation used during RL training.
-    """
-    raise NotImplementedError("GAE calculation is not implemented yet.")
-
-
-def release_memory(rank: int) -> None:
-    """
-    Placeholder utility that can be used to debug CUDA memory usage.
-    """
-    raise NotImplementedError("GPU memory release helper is not implemented yet.")
-
 
 class BayesAdaptiveLLMTrainer(Trainer):
     """
