@@ -5,12 +5,74 @@ and later plug in MCTS-based preference generation plus DPO training.
 """
 
 import os
-from typing import Any, Dict, Optional, Sequence, Tuple
+import json
+import random
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 from loguru import logger
 
 from base.pipeline import Pipeline
+from baselines.GDP_Zero.game import DialogGame
+from baselines.GDP_Zero.openloop_mcts import OpenLoopMCTS
+from baselines.GDP_Zero.utils import update_state_for_open_loop_mcts
+from bayes_adaptive_llm.utils import (
+    sanitize_persona_description,
+    stringify_dialogue_context,
+    get_preference_pair,
+)
+from config.constants import PERSUATION
 from logger.wandb_logger import WanDBLogger
+
+
+class PersonaDialogGame(DialogGame):
+    """
+    DialogGame that injects per-turn persona hints into the state so the Persuader
+    generation can condition on the current persuadee profile.
+    """
+
+    def get_next_state(self, state, action):
+        # attach selected goal and persona hint to the state passed into generation
+        state = state.copy()
+        state["pred_goal"] = action
+        raw_persona = getattr(self.user_simulator, "user_profile_description", None)
+        persona_hint = sanitize_persona_description(raw_persona or "")
+        if persona_hint:
+            state["persona_hint"] = persona_hint
+
+        system_response = self.generation_method.generate_response(state)
+        user_response = self.user_simulator.respond(state)
+        next_state = update_state_for_open_loop_mcts(
+            state=state,
+            action=action,
+            system_response=system_response,
+            user_response=user_response,
+        )
+        return next_state
+
+
+class _UniformMCTSPlayer:
+    """
+    Minimal player wrapper for OpenLoopMCTS.
+    Uses a uniform prior over actions and exposes id<->goal mappings.
+    """
+
+    def __init__(self, action_mapping: Dict[str, int]):
+        self.goal2id = action_mapping
+        self.id2goal = {v: k for k, v in action_mapping.items()}
+        # dialog_acts ordered by action id so preference export stays stable
+        self.dialog_acts = [goal for goal, _ in sorted(self.goal2id.items(), key=lambda kv: kv[1])]
+
+    def get_valid_moves(self, state):
+        return np.array([1 for _ in self.goal2id.keys()])
+
+    def predict(self, state) -> Tuple[np.ndarray, float]:
+        prior = np.ones(len(self.goal2id), dtype=float)
+        prior /= prior.sum()
+        return prior, 0.0
 
 
 class BayesAdaptiveLLMPipeline(Pipeline):
@@ -91,14 +153,194 @@ class BayesAdaptiveLLMPipeline(Pipeline):
         """
         return self.trainer.predict(instance, action_mapping=action_mapping)
 
-    def generate_preference_pairs_with_mcts(self) -> Sequence[Tuple[Any, Any]]:
+    def generate_preference_pairs_with_mcts(self) -> Sequence[Dict[str, Any]]:
         """
-        Placeholder for the MCTS preference loop.
-        Should return a collection of (chosen, rejected) pairs constructed by
-        sampling rollouts and keeping the highest-scoring samples.
+        Simulate persuasion dialogues with OpenLoopMCTS to extract preference pairs.
+        The pairs are also written to disk if `model_config.preference_pairs_path` is provided,
+        and the in-memory dataset is overwritten so DPO training can consume them directly.
         """
-        logger.warning("MCTS preference generation not implemented; returning empty list.")
-        return []
+        if self.game_config.name != PERSUATION:
+            logger.warning("Preference search is currently implemented for persuasion only; skipping.")
+            return []
+
+        if not self.dev_simulators and not self.test_simulators:
+            raise ValueError("User simulators are required for MCTS preference generation.")
+
+        simulators = self.dev_simulators or self.test_simulators
+        if simulators is None or len(simulators) == 0:
+            raise ValueError("No simulators available for preference generation.")
+
+        # Action space
+        action_mapping = self.dataset.construct_action_mapping(
+            combine=self.model_config.combined_action if not getattr(self.game_config, "is_so_game", False) else False
+        )
+        player = _UniformMCTSPlayer(action_mapping)
+
+        # MCTS configuration
+        num_MCTS_sims = getattr(self.model_config, "num_mcts_sims", 20)
+        max_realizations = getattr(self.model_config, "max_realizations", 5)
+        max_turns = getattr(self.model_config, "max_turns", 5)
+        mcts_cfg = SimpleNamespace(
+            cpuct=1.0,
+            Q_0=getattr(self.model_config, "Q_0", 0.25),
+            max_realizations=max_realizations,
+        )
+
+        # Dialog seeds
+        cases: List[Any] = list(self.dataset.train_instances)
+        max_cases = getattr(self.model_config, "mcts_num_evaluate", None)
+        if max_cases is not None and max_cases > 0:
+            cases = cases[:max_cases]
+
+        random_seed = getattr(self.model_config, "seed", None)
+        if random_seed is not None:
+            random.seed(random_seed)
+            np.random.seed(random_seed)
+
+        preference_pairs: List[Dict[str, Any]] = []
+        preference_path: Optional[Path] = None
+        if getattr(self.model_config, "preference_pairs_path", None):
+            preference_path = Path(self.model_config.preference_pairs_path)
+            preference_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # logging raw responses to bayes_adaptive_llm/logs
+        log_dir = Path(__file__).resolve().parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = log_dir / f"pref_gen_{timestamp}.log"
+        def _log_line(text: str) -> None:
+            with log_file.open("a", encoding="utf-8") as lf:
+                lf.write(text + "\n")
+
+        for dialog_idx, case in enumerate(cases):
+            simulator = random.choice(simulators)
+            dialog_game = PersonaDialogGame(self.game, self.trainer.generation_method, simulator)
+            state = self.game.reset(case, simulator)
+            persona_history: List[Dict[str, str]] = []
+
+            dialog_pairs: List[Dict[str, Any]] = []
+            for turn in range(max_turns):
+                outcome = dialog_game.get_dialog_ended(state)
+                if outcome != 0:
+                    break
+
+                # pick a fresh persona/simulator each turn if available
+                turn_simulator = random.choice(simulators)
+                dialog_game.user_simulator = turn_simulator
+                persona_hint = {}
+                if hasattr(turn_simulator, "user_profile_description"):
+                    raw_desc = getattr(turn_simulator, "user_profile_description", "")
+                    persona_hint["description"] = sanitize_persona_description(raw_desc)
+                if hasattr(turn_simulator, "use_persona") and getattr(turn_simulator, "use_persona"):
+                    persona_history.append({"turn": turn, **persona_hint})
+
+                planner = OpenLoopMCTS(dialog_game, player, mcts_cfg)
+                for _ in range(num_MCTS_sims):
+                    planner.search(state)
+
+                action_prob = planner.get_action_prob(state)
+                if np.sum(action_prob) == 0:
+                    logger.debug("Zero action probability encountered; stopping dialog %s turn %s", dialog_idx, turn)
+                    break
+
+                state_rep = planner._to_string_rep(state)
+                valid_moves = planner.valid_moves.get(state_rep, [])
+                # sample to avoid repeatedly picking the first action when all priors are flat
+                if valid_moves is not None and len(valid_moves) > 0:
+                    prob = action_prob.copy()
+                    prob = prob / prob.sum() if prob.sum() > 0 else np.ones_like(prob) / len(prob)
+                    best_action = int(np.random.choice(len(prob), p=prob))
+                else:
+                    best_action = int(np.argmax(action_prob))
+                goal = player.id2goal[best_action]
+
+                # Step environment to obtain next state and utterances
+                next_state = dialog_game.get_next_state(state, goal)
+                sys_utt = next_state["dialogue_context"][-2]["content"]
+                user_utt = next_state["dialogue_context"][-1]["content"]
+                # _log_line(
+                #     f"[Dialog {dialog_idx} | Turn {turn}] "
+                #     f"Action={goal} | SYS: {sys_utt} | USR: {user_utt} "
+                #     f"| Persona: {persona_hint.get('description', '') if persona_hint else ''}"
+                # )
+                logger.info(
+                    "[Dialog %s | Turn %s] Action=%s | SYS: %s | USR: %s | Persona: %s",
+                    dialog_idx,
+                    turn,
+                    goal,
+                    sys_utt,
+                    user_utt,
+                    persona_hint.get("description", "") if persona_hint else "",
+                )
+                # print full history up to current turn
+                history_str = stringify_dialogue_context(next_state["dialogue_context"])
+                _log_line(f"[Dialog {dialog_idx} | Turn {turn}] History so far:\n{history_str}")
+                logger.info("[History][Dialog %s | Turn %s]\n%s", dialog_idx, turn, history_str)
+
+                pair = get_preference_pair(
+                    action_prob,
+                    state_rep,
+                    player.dialog_acts,
+                    valid_moves,
+                    planner.realizations_Vs,
+                )
+                if pair:
+                    _, best_pair, worst_pair = pair
+                    # _log_line(
+                    #     f"[Dialog {dialog_idx} | Turn {turn}] Preference pair | "
+                    #     f"Chosen: {best_pair[0]} (V={best_pair[1]:.4f}) | "
+                    #     f"Rejected: {worst_pair[0]} (V={worst_pair[1]:.4f})"
+                    # )
+                    logger.info(
+                        "[PrefPair][Dialog %s | Turn %s] Chosen: %s (V=%.4f) | Rejected: %s (V=%.4f)",
+                        dialog_idx,
+                        turn,
+                        best_pair[0],
+                        best_pair[1],
+                        worst_pair[0],
+                        worst_pair[1],
+                    )
+                    dialog_pairs.append(
+                        {
+                            "prompt": stringify_dialogue_context(state["dialogue_context"]),
+                            "chosen": best_pair[0],
+                            "rejected": worst_pair[0],
+                            "turn": turn,
+                            "action": goal,
+                            "dialog_index": dialog_idx,
+                            "system_utterance": sys_utt,
+                            "user_utterance": user_utt,
+                            "persona_hint": persona_hint or None,
+                        }
+                    )
+
+                state = next_state
+                if dialog_game.get_dialog_ended(state) != 0:
+                    break
+
+            outcome = dialog_game.get_dialog_ended(state)
+            if outcome == 1.0:
+                preference_pairs.extend(dialog_pairs)
+                # log full dialog transcript
+                full_dialog = stringify_dialogue_context(state["dialogue_context"])
+                _log_line(f"=== Dialog {dialog_idx} transcript ===\n{full_dialog}\n=== End Dialog {dialog_idx} ===")
+            else:
+                logger.debug("Dialog %s did not succeed (outcome=%.1f); skipping its preference pairs.", dialog_idx, outcome)
+
+        if preference_path and preference_pairs:
+            with preference_path.open("w", encoding="utf-8") as f:
+                for item in preference_pairs:
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            logger.info("Wrote %d preference pairs to %s", len(preference_pairs), preference_path)
+
+        # Overwrite dataset splits so DPO trainer can consume them directly.
+        if preference_pairs:
+            self.dataset.train_instances = preference_pairs
+            self.dataset.dev_instances = []
+            self.dataset.test_instances = []
+
+        logger.info("Generated %d preference pairs from %d dialogs.", len(preference_pairs), len(cases))
+        return preference_pairs
 
     def run_online_test(self):
         """

@@ -56,6 +56,20 @@ class ChatGPTGeneration(LLMGeneration):
         else:
             raise Exception("Invalid Scenario ...")
 
+        # Inject persona hint for persuasion if provided
+        persona_hint = instance.get("persona_hint")
+        if self.generation_config.scenario_name == PERSUATION and persona_hint:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Persuadee persona description:\n"
+                        f"{persona_hint}\n"
+                        "Adapt your persuasion tone, reasoning, and examples so they resonate with this persona."
+                    ),
+                }
+            )
+
         messages.extend(dialogue_context)
 
         # calling the llm for response generation
