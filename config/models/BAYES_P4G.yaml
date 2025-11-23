@@ -17,6 +17,8 @@ run_sft: false
 run_dpo: false
 run_offline_eval: false
 run_online_eval: false
+max_gen_length: 256
+max_gen_tokens: 256
 
 # SFT hyperparameters (memory-friendly)
 batch_size: 1
@@ -40,9 +42,6 @@ gradient_checkpointing: true
 # Path to preference pairs (jsonl) used for DPO; dataset/loader should read this.
 preference_pairs_path: "data/preference_pairs_gpt-3.5-turbo.jsonl"
 
-# Generation
-temperature: 0.7
-max_gen_tokens: 64
 
 # Prompt scaffolds for persuasion (override as needed)
 persuader_prompt: |

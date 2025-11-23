@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from base.text_gen import LLMGeneration
 from config.config import GenerationConfig
 from utils.generation import construct_prompt_for_chat_gpt_response_generation_negotiation, \
@@ -34,6 +36,8 @@ class ChatGPTGeneration(LLMGeneration):
         :return:
         """
         dialogue_context = instance['dialogue_context']
+        dialog_id = instance.get("dialog_id", "unknown")
+        turn_id = instance.get("turn_id", -1)
 
         # the recommendation scenario
         if self.generation_config.scenario_name == RECOMMENDATION:
@@ -79,6 +83,19 @@ class ChatGPTGeneration(LLMGeneration):
             {'role': 'user', 'content': f"{goal_description}. "
                                         'Please reply with only one short and succinct sentence.'}
         )
+
+        # log prompt for debugging preference generation
+        log_dir = Path(__file__).resolve().parents[1] / "bayes_adaptive_llm" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "prompts.log"
+        header = f"===== Dialogue {dialog_id} =====" if turn_id == 0 else None
+        with log_file.open("a", encoding="utf-8") as lf:
+            if header:
+                lf.write(header + "\n")
+            lf.write(f"[Turn {turn_id}] SYSTEM prompt:\n")
+            for m in messages:
+                lf.write(f"{m.get('role')}: {m.get('content')}\n")
+            lf.write("===== End Turn =====\n")
 
         response = call_llm(messages,
                             n=1,

@@ -50,14 +50,3 @@ class BayesAdaptiveLLMModel(Model):
         cls_token = self.drop_out(cls_token)
         logits = self.out_layer(cls_token)
         return logits
-
-    def score_candidates(self,
-                         dialogue_context: Sequence[Dict[str, Any]],
-                         candidates: Sequence[str],
-                         **kwargs) -> torch.Tensor:
-        """
-        Placeholder hook for future MCTS preference scoring.
-        Given a dialogue context and multiple candidate actions/responses,
-        return a tensor of scores so an MCTS loop can pick the highest-valued sample.
-        """
-        raise NotImplementedError("Candidate scoring for MCTS has not been implemented yet.")

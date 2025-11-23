@@ -42,7 +42,7 @@ class BayesAdaptiveConfig(ModelConfig):
 
     # inference / prompting
     temperature = 0.7
-    max_gen_tokens = 64
+    max_gen_tokens = 256
     max_sequence_length = 512
 
     # Prompt scaffolds (override via YAML to customise Persuader/Persuadee wording)
@@ -84,9 +84,9 @@ class BayesAdaptiveConfig(ModelConfig):
 
     # MCTS loop for preference pair generation
     mcts_num_evaluate = 4
-    num_mcts_sims = 20
-    max_realizations = 5
-    max_turns = 5
+    num_mcts_sims = 15
+    max_realizations = 3
+    max_turns = 12
     top_k_preferences = 1  # pick the highest-scoring samples to form pairs
 
     def __init__(self, params):

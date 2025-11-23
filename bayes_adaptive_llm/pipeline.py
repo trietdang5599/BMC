@@ -177,7 +177,7 @@ class BayesAdaptiveLLMPipeline(Pipeline):
         player = _UniformMCTSPlayer(action_mapping)
 
         # MCTS configuration
-        num_MCTS_sims = getattr(self.model_config, "num_mcts_sims", 20)
+        num_MCTS_sims = getattr(self.model_config, "num_mcts_sims", 15)
         max_realizations = getattr(self.model_config, "max_realizations", 5)
         max_turns = getattr(self.model_config, "max_turns", 5)
         mcts_cfg = SimpleNamespace(
@@ -213,26 +213,23 @@ class BayesAdaptiveLLMPipeline(Pipeline):
                 lf.write(text + "\n")
 
         for dialog_idx, case in enumerate(cases):
+            # fix persuadee (simulator/persona) per dialog, similar to TRIP
             simulator = random.choice(simulators)
             dialog_game = PersonaDialogGame(self.game, self.trainer.generation_method, simulator)
             state = self.game.reset(case, simulator)
             persona_history: List[Dict[str, str]] = []
+            persona_hint = {}
+            if hasattr(simulator, "user_profile_description"):
+                raw_desc = getattr(simulator, "user_profile_description", "")
+                persona_hint["description"] = sanitize_persona_description(raw_desc)
+            if persona_hint:
+                persona_history.append({"turn": 0, **persona_hint})
 
             dialog_pairs: List[Dict[str, Any]] = []
             for turn in range(max_turns):
                 outcome = dialog_game.get_dialog_ended(state)
                 if outcome != 0:
                     break
-
-                # pick a fresh persona/simulator each turn if available
-                turn_simulator = random.choice(simulators)
-                dialog_game.user_simulator = turn_simulator
-                persona_hint = {}
-                if hasattr(turn_simulator, "user_profile_description"):
-                    raw_desc = getattr(turn_simulator, "user_profile_description", "")
-                    persona_hint["description"] = sanitize_persona_description(raw_desc)
-                if hasattr(turn_simulator, "use_persona") and getattr(turn_simulator, "use_persona"):
-                    persona_history.append({"turn": turn, **persona_hint})
 
                 planner = OpenLoopMCTS(dialog_game, player, mcts_cfg)
                 for _ in range(num_MCTS_sims):
@@ -255,6 +252,8 @@ class BayesAdaptiveLLMPipeline(Pipeline):
                 goal = player.id2goal[best_action]
 
                 # Step environment to obtain next state and utterances
+                state["dialog_id"] = dialog_idx
+                state["turn_id"] = turn
                 next_state = dialog_game.get_next_state(state, goal)
                 sys_utt = next_state["dialogue_context"][-2]["content"]
                 user_utt = next_state["dialogue_context"][-1]["content"]
@@ -263,19 +262,9 @@ class BayesAdaptiveLLMPipeline(Pipeline):
                 #     f"Action={goal} | SYS: {sys_utt} | USR: {user_utt} "
                 #     f"| Persona: {persona_hint.get('description', '') if persona_hint else ''}"
                 # )
-                logger.info(
-                    "[Dialog %s | Turn %s] Action=%s | SYS: %s | USR: %s | Persona: %s",
-                    dialog_idx,
-                    turn,
-                    goal,
-                    sys_utt,
-                    user_utt,
-                    persona_hint.get("description", "") if persona_hint else "",
-                )
                 # print full history up to current turn
                 history_str = stringify_dialogue_context(next_state["dialogue_context"])
-                _log_line(f"[Dialog {dialog_idx} | Turn {turn}] History so far:\n{history_str}")
-                logger.info("[History][Dialog %s | Turn %s]\n%s", dialog_idx, turn, history_str)
+                # _log_line(f"[Dialog {dialog_idx} | Turn {turn}] History so far:\n{history_str}")
 
                 pair = get_preference_pair(
                     action_prob,
@@ -291,14 +280,10 @@ class BayesAdaptiveLLMPipeline(Pipeline):
                     #     f"Chosen: {best_pair[0]} (V={best_pair[1]:.4f}) | "
                     #     f"Rejected: {worst_pair[0]} (V={worst_pair[1]:.4f})"
                     # )
-                    logger.info(
-                        "[PrefPair][Dialog %s | Turn %s] Chosen: %s (V=%.4f) | Rejected: %s (V=%.4f)",
-                        dialog_idx,
-                        turn,
-                        best_pair[0],
-                        best_pair[1],
-                        worst_pair[0],
-                        worst_pair[1],
+                    _log_line(
+                        f"[Dialog {dialog_idx} | Turn {turn}] History+Pref:\n{history_str}\n"
+                        f"Chosen: {best_pair[0]} (V={best_pair[1]:.4f})\n"
+                        f"Rejected: {worst_pair[0]} (V={worst_pair[1]:.4f})"
                     )
                     dialog_pairs.append(
                         {
