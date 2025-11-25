@@ -231,6 +231,8 @@ class BayesAdaptiveLLMModel(Model):
                 cls_token = outputs.logits
                 if cls_token.dim() == 3:
                     cls_token = cls_token[:, -1, :]
+        # Align dtype with classifier weights to avoid mixed-precision matmul issues.
+        cls_token = cls_token.to(self.out_layer.weight.dtype)
         cls_token = self.drop_out(cls_token)
         logits = self.out_layer(cls_token)
         return logits
