@@ -545,15 +545,19 @@ class BayesAdaptiveLLMTrainer(Trainer):
         """
         device = device or getattr(self, "device", None) or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        preference_pairs: List[Dict[str, Any]] = list(getattr(dataset, "train_instances", []) or [])
-        if not preference_pairs:
-            pref_path = getattr(self.model_config, "preference_pairs_path", None)
-            if pref_path and os.path.exists(pref_path):
-                with open(pref_path, "r", encoding="utf-8") as handle:
-                    if pref_path.endswith(".jsonl"):
-                        preference_pairs = [json.loads(line) for line in handle if line.strip()]
-                    else:
-                        preference_pairs = json.load(handle)
+        pref_path = getattr(self.model_config, "preference_pairs_path", None)
+        preference_pairs: List[Dict[str, Any]] = []
+        if pref_path is None:
+            loguru_logger.warning("No preference_pairs_path provided; skipping DPO.")
+            return
+        if not os.path.exists(pref_path):
+            loguru_logger.warning("Preference pairs file not found at %s; skipping DPO.", pref_path)
+            return
+        with open(pref_path, "r", encoding="utf-8") as handle:
+            if pref_path.endswith(".jsonl"):
+                preference_pairs = [json.loads(line) for line in handle if line.strip()]
+            else:
+                preference_pairs = json.load(handle)
 
         required_keys = {"prompt", "chosen", "rejected"}
         filtered_pairs = [row for row in preference_pairs if isinstance(row, dict) and required_keys.issubset(row)]
