@@ -51,8 +51,8 @@ from config.constants import RECOMMENDATION, NEGOTIATION, EMOTIONAL_SUPPORT, SL_
 
 def _patch_dpo_trainer_get_batch_samples() -> None:
     """
-    Align TRL's DPOTrainer.get_batch_samples signature with newer HF Trainer which passes a device argument.
-    Some TRL versions define get_batch_samples(self, iterator, num_batches) and fail when transformers adds `device`.
+    Ensure TRL's DPOTrainer.get_batch_samples uses the raw causal LM (with generate) rather than
+    an accelerator wrapper / generator. Also tolerates both legacy and new signatures (with device).
     """
     if DPOTrainer is None:
         return
@@ -61,25 +61,23 @@ def _patch_dpo_trainer_get_batch_samples() -> None:
     except Exception:
         return
 
-    if "device" in sig.parameters:
-        return
-
     original_get_batch_samples = DPOTrainer.get_batch_samples
 
-    def _wrapped(self, iterator, num_batches, device=None):
-        # Ensure model used inside TRL is the causal LM (not an accelerator wrapper/generator).
-        if hasattr(self, "_policy_model_for_dpo"):
-            try:
-                self.model = self._policy_model_for_dpo
-            except Exception:
-                pass
-        # Also ensure reference model is the raw LM if stashed.
-        if hasattr(self, "_reference_model_for_dpo"):
-            try:
-                self.ref_model = self._reference_model_for_dpo
-            except Exception:
-                pass
-        return original_get_batch_samples(self, iterator, num_batches)
+    # Preserve signature while reattaching the correct models.
+    if "device" in sig.parameters:
+        def _wrapped(self, iterator, num_batches, device=None, *args, **kwargs):
+            if hasattr(self, "_policy_model_for_dpo"):
+                self.model = getattr(self, "_policy_model_for_dpo")
+            if hasattr(self, "_reference_model_for_dpo"):
+                self.ref_model = getattr(self, "_reference_model_for_dpo")
+            return original_get_batch_samples(self, iterator, num_batches, device=device, *args, **kwargs)
+    else:
+        def _wrapped(self, iterator, num_batches, *args, **kwargs):
+            if hasattr(self, "_policy_model_for_dpo"):
+                self.model = getattr(self, "_policy_model_for_dpo")
+            if hasattr(self, "_reference_model_for_dpo"):
+                self.ref_model = getattr(self, "_reference_model_for_dpo")
+            return original_get_batch_samples(self, iterator, num_batches, *args, **kwargs)
 
     DPOTrainer.get_batch_samples = _wrapped
 
