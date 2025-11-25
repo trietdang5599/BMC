@@ -10,6 +10,8 @@ import math
 import os
 import random
 import warnings
+import json
+import copy
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -40,6 +42,7 @@ from bayes_adaptive_llm.data_processor import (
     BayesTorchDatasetForPersuation,
     BayesTorchDatasetForRecommendation,
 )
+from bayes_adaptive_llm.utils import coerce_to_float, stringify_dialogue_context
 from config.constants import RECOMMENDATION, NEGOTIATION, EMOTIONAL_SUPPORT, SL_RATIO, SUCCESS_RATE, AVG_TURN, FAIRNESS, \
     TOXICITY, ITEM_FREQ, USER_REWARD, PERSUATION, P4G_GOAL2DESCRIPTION, NEGOTIATION_GOAL2DESCRIPTION, ES_CONV_GOAL2DESCRIPTION, \
     P4G_GOAL2DESCRIPTION
@@ -326,7 +329,11 @@ class BayesAdaptiveLLMTrainer(Trainer):
     def prepare_reference_model(self):
         reference_model = getattr(self.model_config, "reference_model", None)
         if reference_model is None:
-            raise ValueError("model_config.reference_model must be provided for DPO training.")
+            # Default to a frozen copy of the current model if none is provided.
+            loguru_logger.warning("reference_model not provided; cloning current model for DPO.")
+            reference_model = copy.deepcopy(self.model)
+            # cache on config so repeated calls reuse the same copy
+            setattr(self.model_config, "reference_model", reference_model)
         reference_model.requires_grad_(False)
         reference_model.eval()
         return reference_model
@@ -421,6 +428,28 @@ class BayesAdaptiveLLMTrainer(Trainer):
             raise ImportError("trl is required for DPO training. Install it with `pip install trl`.")
 
         train_pref, dev_pref, _ = self.process_dataset(dataset)
+
+        def _has_pref_fields(ex: Any) -> bool:
+            if isinstance(ex, dict):
+                return all(k in ex for k in ("prompt", "chosen", "rejected"))
+            return all(hasattr(ex, k) for k in ("prompt", "chosen", "rejected"))
+
+        # If dataset is not already preference-formatted, try loading from jsonl.
+        if (not train_pref) or not _has_pref_fields(train_pref[0]):
+            pref_path = getattr(self.model_config, "preference_pairs_path", None)
+            if pref_path is None or not os.path.exists(pref_path):
+                raise ValueError(
+                    "Preference pairs are missing. Set model_config.preference_pairs_path to a jsonl file "
+                    "with prompt/chosen/rejected fields, or ensure dataset.train_instances contain them."
+                )
+            loguru_logger.info("Loading preference pairs from %s", pref_path)
+            with open(pref_path, "r", encoding="utf-8") as f:
+                pref_data = [json.loads(line) for line in f if line.strip()]
+            if not pref_data:
+                raise ValueError(f"No preference pairs loaded from {pref_path}.")
+            dataset.set_instances(pref_data, [], [])
+            train_pref, dev_pref, _ = self.process_dataset(dataset)
+
         train_dataset, eval_dataset = self.prepare_preference_datasets(train_pref, dev_pref)
 
         reference_model = self.prepare_reference_model()
@@ -443,6 +472,10 @@ class BayesAdaptiveLLMTrainer(Trainer):
         elif max_prompt_length is not None and effective_max_length is not None:
             max_prompt_length = min(max_prompt_length, effective_max_length)
 
+        # Ensure numeric hyperparameters before building DPO args.
+        self.model_config.learning_rate = coerce_to_float(getattr(self.model_config, "learning_rate", 1e-5), 1e-5)
+        self.model_config.weight_decay = coerce_to_float(getattr(self.model_config, "weight_decay", 0.0), 0.0)
+
         dpo_args = self.setup_dpo_config(do_eval=eval_dataset is not None,
                                          effective_max_length=effective_max_length,
                                          max_prompt_length=max_prompt_length)
@@ -453,7 +486,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
             args=dpo_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            processing_class=self.tokenizer,
+            tokenizer=self.tokenizer,
         )
 
         dpo_trainer.train()
