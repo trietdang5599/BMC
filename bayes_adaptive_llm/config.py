@@ -42,7 +42,6 @@ class BayesAdaptiveConfig(ModelConfig):
     logging_steps = 10
     save_total_limit = 2
     max_grad_norm = 1.0
-    warmup_ratio = 0.05
     optim = "adamw_torch"
     fp16 = False
     bf16 = True
@@ -54,19 +53,18 @@ class BayesAdaptiveConfig(ModelConfig):
 
     # DPO-related knobs
     dpo_beta = 0.1
-    dpo_model_path = "gpt2"
     dpo_adapter_path = None
     dpo_epochs = 3
     dpo_batch_size = 2
-    dpo_learning_rate = 5e-5
+    dpo_learning_rate = 1e-5
     dpo_max_length = 512
     dpo_use_wandb = False
     dpo_weight_decay = 0.01
-    dpo_warmup_ratio = 0.05
+    dpo_warmup_ratio = 0.1
     dpo_fp16 = False
-    dpo_bf16 = True
+    dpo_bf16 = False
     dpo_optim = "adamw_torch"   
-    dpo_gradient_accumulation = 16
+    dpo_gradient_accumulation = 4
     max_length = None
     max_prompt_length = None
     gradient_checkpointing = False

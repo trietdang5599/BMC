@@ -557,19 +557,19 @@ class BayesAdaptiveLLMTrainer(Trainer):
             return
         preference_pairs = filtered_pairs
 
-        model_path = getattr(self.model_config, "dpo_model_path", getattr(self.model_config, "plm", "gpt2"))
+        model_path = getattr(self.model_config, "plm", None)
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         max_length = getattr(self.model_config, "dpo_max_length", 1024)
         batch_size = getattr(self.model_config, "dpo_batch_size", 2)
         epochs = getattr(self.model_config, "dpo_epochs", 3)
-        learning_rate = getattr(self.model_config, "dpo_learning_rate", 3e-6)
+        learning_rate = getattr(self.model_config, "dpo_learning_rate", 1e-5)
         beta = getattr(self.model_config, "dpo_beta", 0.1)
         weight_decay = getattr(self.model_config, "dpo_weight_decay", 0.01)
-        warmup_ratio = getattr(self.model_config, "dpo_warmup_ratio", 0.0)
+        warmup_ratio = getattr(self.model_config, "dpo_warmup_ratio", 0.1)
         optim_name = getattr(self.model_config, "dpo_optim", "adamw_torch")
-        grad_accum = max(1, int(getattr(self.model_config, "dpo_gradient_accumulation", 1)))
+        grad_accum = max(1, int(getattr(self.model_config, "dpo_gradient_accumulation", 4)))
         use_fp16 = bool(getattr(self.model_config, "dpo_fp16", False))
         use_bf16 = bool(getattr(self.model_config, "dpo_bf16", False))
 
@@ -598,14 +598,9 @@ class BayesAdaptiveLLMTrainer(Trainer):
             disable_tqdm = not self.accelerator.is_local_main_process
 
         loguru_logger.info(
-            "Starting DPO training: %d valid pairs, epochs=%d, batch_size=%d, lr=%.1e, beta=%.2f, grad_accum=%d, optim=%s",
-            len(preference_pairs),
-            epochs,
-            batch_size,
-            learning_rate,
-            beta,
-            grad_accum,
-            optim_name,
+            f"Starting DPO training: {len(preference_pairs)} valid pairs, "
+            f"epochs={epochs}, batch_size={batch_size}, lr={learning_rate:.1e}, "
+            f"beta={beta:.2f}, grad_accum={grad_accum}, optim={optim_name}"
         )
 
         total_steps = math.ceil(len(dataloader) / grad_accum) * epochs
@@ -636,7 +631,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
                 progress.set_postfix(loss=step_losses[-1])
 
             avg_loss = float(np.mean(step_losses)) if step_losses else 0.0
-            loguru_logger.info("Epoch %d completed. Avg loss: %.4f", epoch + 1, avg_loss)
+            loguru_logger.info(f"Epoch {epoch + 1} completed. Avg loss: {avg_loss:.4f}")
 
         adapter_dir = getattr(self.model_config, "dpo_adapter_path", None)
         if not adapter_dir:
