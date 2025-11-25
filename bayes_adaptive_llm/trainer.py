@@ -562,20 +562,33 @@ class BayesAdaptiveLLMTrainer(Trainer):
         if getattr(self.model_config, "dpo_use_sft_checkpoint", False):
             saved_dir = getattr(self.model_config, "saved_dir", None)
             candidate = None
+            adapter_only = None
             if saved_dir and os.path.isdir(saved_dir):
                 if os.path.exists(os.path.join(saved_dir, "config.json")):
                     candidate = saved_dir
                 else:
                     for entry in os.listdir(saved_dir):
                         subdir = os.path.join(saved_dir, entry)
-                        if os.path.isdir(subdir) and os.path.exists(os.path.join(subdir, "config.json")):
+                        if not os.path.isdir(subdir):
+                            continue
+                        if os.path.exists(os.path.join(subdir, "config.json")):
                             candidate = subdir
                             break
+                        if os.path.exists(os.path.join(subdir, "dpo_adapter", "adapter_config.json")):
+                            adapter_only = os.path.join(subdir, "dpo_adapter")
+                    if not candidate and os.path.exists(os.path.join(saved_dir, "dpo_adapter", "adapter_config.json")):
+                        adapter_only = os.path.join(saved_dir, "dpo_adapter")
             if candidate:
                 loguru_logger.info("Using SFT checkpoint at %s for DPO initialization.", candidate)
                 model_path = candidate
             else:
-                loguru_logger.warning("Requested SFT checkpoint for DPO but no HF config.json found under saved_dir; falling back.")
+                if adapter_only:
+                    loguru_logger.warning(
+                        "Found LoRA adapter at %s but no base HF checkpoint (config.json); falling back to dpo_model_path/plm.",
+                        adapter_only,
+                    )
+                else:
+                    loguru_logger.warning("Requested SFT checkpoint for DPO but no HF config.json found under saved_dir; falling back.")
 
         if not model_path:
             model_path = getattr(self.model_config, "plm", "gpt2")
