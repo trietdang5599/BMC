@@ -557,7 +557,28 @@ class BayesAdaptiveLLMTrainer(Trainer):
             return
         preference_pairs = filtered_pairs
 
-        model_path = getattr(self.model_config, "plm", None)
+        # Resolve initialization checkpoint: prefer explicit DPO path; optionally override with SFT checkpoint.
+        model_path = getattr(self.model_config, "dpo_model_path", None)
+        if getattr(self.model_config, "dpo_use_sft_checkpoint", False):
+            saved_dir = getattr(self.model_config, "saved_dir", None)
+            candidate = None
+            if saved_dir and os.path.isdir(saved_dir):
+                if os.path.exists(os.path.join(saved_dir, "config.json")):
+                    candidate = saved_dir
+                else:
+                    for entry in os.listdir(saved_dir):
+                        subdir = os.path.join(saved_dir, entry)
+                        if os.path.isdir(subdir) and os.path.exists(os.path.join(subdir, "config.json")):
+                            candidate = subdir
+                            break
+            if candidate:
+                loguru_logger.info("Using SFT checkpoint at %s for DPO initialization.", candidate)
+                model_path = candidate
+            else:
+                loguru_logger.warning("Requested SFT checkpoint for DPO but no HF config.json found under saved_dir; falling back.")
+
+        if not model_path:
+            model_path = getattr(self.model_config, "plm", "gpt2")
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token

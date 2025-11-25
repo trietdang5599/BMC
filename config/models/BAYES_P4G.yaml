@@ -34,10 +34,17 @@ max_sequence_length: 256
 
 # DPO-specific
 dpo_beta: 0.1
-max_length: 256
-max_prompt_length: 256
+max_length: 1024
+dpo_batch_size: 2
+max_prompt_length: 1024
+dpo_epochs: 3
+dpo_learning_rate: 1e-5
+dpo_weight_decay: 0.01
+dpo_warmup_ratio: 0.1
+dpo_optim: "adamw_torch"
+dpo_gradient_accumulation: 4
 fp16: true
-bf16: false
+bf16: true
 gradient_checkpointing: true
 # Path to preference pairs (jsonl) used for DPO; each row should include
 # dialog_id, prompt, chosen, rejected, and an optional persona_hint with

@@ -53,6 +53,8 @@ class BayesAdaptiveConfig(ModelConfig):
 
     # DPO-related knobs
     dpo_beta = 0.1
+    dpo_model_path = "roberta-large"
+    dpo_use_sft_checkpoint = True
     dpo_adapter_path = None
     dpo_epochs = 3
     dpo_batch_size = 2
