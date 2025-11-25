@@ -287,20 +287,139 @@ class BayesAdaptiveLLMTrainer(Trainer):
         return results
 
 #region Preparation for DPO training
-    def _preference_example_to_dict(self, example: Any) -> Dict[str, str]:
-        if isinstance(example, dict):
-            prompt = example.get("prompt")
-            chosen = example.get("chosen")
-            rejected = example.get("rejected")
-        else:
-            prompt = getattr(example, "prompt", None)
-            chosen = getattr(example, "chosen", None)
-            rejected = getattr(example, "rejected", None)
+    def _normalize_persona_hint(self, persona_hint: Any) -> Dict[str, str]:
+        """
+        Normalize persona hints so the formatter can safely prepend them to prompts.
+        Accepts dicts with expected keys, loose dicts, strings, or None.
+        """
+        if persona_hint is None:
+            return {}
+        if isinstance(persona_hint, str):
+            return {"personality": persona_hint}
+        if not isinstance(persona_hint, dict):
+            return {}
+
+        normalized: Dict[str, str] = {}
+        if persona_hint.get("personality"):
+            normalized["personality"] = str(persona_hint["personality"])
+        if persona_hint.get("decision_making_style"):
+            normalized["decision_making_style"] = str(persona_hint["decision_making_style"])
+        # fallbacks for legacy keys
+        if not normalized and persona_hint.get("description"):
+            normalized["personality"] = str(persona_hint["description"])
+        return normalized
+
+    def _format_prompt_with_persona(self, prompt: str, persona_hint: Any) -> Tuple[str, Dict[str, str]]:
+        """
+        Inject persona hints (if provided) into the prompt so policy and reference
+        models see consistent conditioning signals.
+        """
+        normalized_persona = self._normalize_persona_hint(persona_hint)
+        if not prompt:
+            raise ValueError("Preference example is missing a prompt.")
+
+        if not normalized_persona:
+            return prompt, {}
+
+        persona_lines: List[str] = []
+        if normalized_persona.get("personality"):
+            persona_lines.append(f"Persona: {normalized_persona['personality']}")
+        if normalized_persona.get("decision_making_style"):
+            persona_lines.append(f"Decision-making style: {normalized_persona['decision_making_style']}")
+
+        persona_block = "Persona hint:\n" + "\n".join(f"- {line}" for line in persona_lines)
+        formatted_prompt = f"{persona_block}\n\n{prompt}"
+        return formatted_prompt, normalized_persona
+
+    def _preference_example_to_row(self, example: Any, idx: int) -> Dict[str, Any]:
+        """
+        Convert a raw preference example into the schema consumed by TRL.
+        Ensures persona hints are folded into the prompt while retaining metadata.
+        """
+        def _get(field: str, default=None):
+            if isinstance(example, dict):
+                return example.get(field, default)
+            return getattr(example, field, default)
+
+        prompt = _get("prompt")
+        chosen = _get("chosen")
+        rejected = _get("rejected")
         if prompt is None or chosen is None or rejected is None:
             raise ValueError("Preference example must contain prompt, chosen and rejected fields.")
-        return {"prompt": prompt, "chosen": chosen, "rejected": rejected}
+
+        dialog_id = _get("dialog_id", idx)
+        persona_hint = _get("persona_hint")
+        formatted_prompt, normalized_persona = self._format_prompt_with_persona(prompt, persona_hint)
+
+        return {
+            "dialog_id": dialog_id,
+            "prompt": formatted_prompt,
+            "raw_prompt": prompt,
+            "chosen": chosen,
+            "rejected": rejected,
+            "persona_hint": normalized_persona or None,
+        }
+
+    def _preference_split_is_ready(self, pref_split: Sequence[Any]) -> bool:
+        """
+        Check whether a preference split already follows the expected schema.
+        """
+        if not pref_split:
+            return False
+        sample = pref_split[0]
+        if isinstance(sample, dict):
+            return all(k in sample for k in ("prompt", "chosen", "rejected"))
+        return all(hasattr(sample, k) for k in ("prompt", "chosen", "rejected"))
+
+    def _load_preference_pairs_from_path(self, pref_path: str) -> List[Dict[str, Any]]:
+        """
+        Load preference pairs from json/jsonl on disk adhering to the new schema.
+        """
+        if not pref_path:
+            raise ValueError("Preference path is not provided for DPO training.")
+        if not os.path.exists(pref_path):
+            raise FileNotFoundError(f"Preference pairs path does not exist: {pref_path}")
+
+        data: List[Dict[str, Any]]
+        if pref_path.endswith(".jsonl"):
+            with open(pref_path, "r", encoding="utf-8") as f:
+                data = [json.loads(line) for line in f if line.strip()]
+        else:
+            with open(pref_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                # allow wrapped payloads e.g., {"data": [...]} for flexibility
+                data = loaded.get("data") or loaded.get("examples") or []
+                if not data and isinstance(loaded.get("train"), list):
+                    data = loaded["train"]
+            else:
+                data = loaded
+
+        if not isinstance(data, list) or not data:
+            raise ValueError(f"No preference pairs loaded from {pref_path}.")
+        loguru_logger.info("Loaded %d preference pairs from %s", len(data), pref_path)
+        return data
+
+    def _resolve_preference_splits(self, dataset) -> Tuple[List[Any], List[Any]]:
+        """
+        Choose preference data from the in-memory dataset or fall back to the path
+        configured in model_config.preference_pairs_path. Updates the dataset in-place
+        when loading from disk to keep downstream code consistent.
+        """
+        train_pref, dev_pref, _ = self.process_dataset(dataset)
+        if self._preference_split_is_ready(train_pref):
+            return train_pref, dev_pref
+
+        pref_path = getattr(self.model_config, "preference_pairs_path", None)
+        pref_data = self._load_preference_pairs_from_path(pref_path)
+        dataset.set_instances(pref_data, [], [])
+        train_pref, dev_pref, _ = self.process_dataset(dataset)
+        return train_pref, dev_pref
 
     def prepare_preference_datasets(self, train_pref: List[Any], val_pref: Optional[List[Any]] = None):
+        """
+        Build Hugging Face datasets for DPOTrainer from raw preference rows.
+        """
         if not train_pref:
             raise ValueError("No preference examples available for training.")
 
@@ -324,8 +443,19 @@ class BayesAdaptiveLLMTrainer(Trainer):
         if not train_pref:
             raise ValueError("Not enough preference examples for training after validation split.")
 
-        train_dataset = HFDataset.from_list([self._preference_example_to_dict(ex) for ex in train_pref])
-        eval_dataset = HFDataset.from_list([self._preference_example_to_dict(ex) for ex in eval_pref]) if eval_pref else None
+        train_rows = [self._preference_example_to_row(ex, idx) for idx, ex in enumerate(train_pref)]
+        eval_rows = [self._preference_example_to_row(ex, idx) for idx, ex in enumerate(eval_pref)] if eval_pref else []
+
+        persona_coverage = sum(1 for row in train_rows if row["persona_hint"]) / len(train_rows)
+        loguru_logger.info(
+            "Prepared DPO datasets | train=%d eval=%d | persona hints on %.1f%% of train rows",
+            len(train_rows),
+            len(eval_rows),
+            persona_coverage * 100,
+        )
+
+        train_dataset = HFDataset.from_list(train_rows)
+        eval_dataset = HFDataset.from_list(eval_rows) if eval_rows else None
         return train_dataset, eval_dataset
 
     def setup_dpo_config(self, do_eval: bool, effective_max_length: Optional[int], max_prompt_length: Optional[int]) -> DPOConfig:
@@ -363,6 +493,9 @@ class BayesAdaptiveLLMTrainer(Trainer):
         )
 
     def prepare_reference_model(self, policy_model=None):
+        """
+        Resolve or create the frozen reference model for DPO training.
+        """
         reference_model = getattr(self.model_config, "reference_model", None)
         if reference_model is None:
             target = policy_model if policy_model is not None else self.model
@@ -374,6 +507,12 @@ class BayesAdaptiveLLMTrainer(Trainer):
         reference_model.requires_grad_(False)
         reference_model.eval()
         return reference_model
+
+    def _resolve_policy_model(self):
+        """
+        Ensure DPOTrainer receives the causal LM (not the policy wrapper).
+        """
+        return getattr(self.model, "plm", self.model)
 #endregion
 
     def train_sft(self, dataset, device: Optional[torch.device] = None) -> None:
@@ -459,7 +598,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
 
     def train_dpo(self, dataset, device: Optional[torch.device] = None) -> None:
         """
-        Train the policy using Direct Preference Optimisation.
+        Train the policy using Direct Preference Optimisation on the new persona-aware schema.
         """
         if DPOTrainer is None or DPOConfig is None:
             raise ImportError("trl is required for DPO training. Install it with `pip install trl`.")
@@ -467,40 +606,25 @@ class BayesAdaptiveLLMTrainer(Trainer):
         # Patch TRL DPOTrainer to accept the extra `device` arg newer transformers passes.
         _patch_dpo_trainer_get_batch_samples()
 
-        # Ensure we hand DPOTrainer a causal LM with generate(), not the policy wrapper.
-        policy_model = getattr(self.model, "plm", self.model)
+        policy_model = self._resolve_policy_model()
 
-        train_pref, dev_pref, _ = self.process_dataset(dataset)
-
-        def _has_pref_fields(ex: Any) -> bool:
-            if isinstance(ex, dict):
-                return all(k in ex for k in ("prompt", "chosen", "rejected"))
-            return all(hasattr(ex, k) for k in ("prompt", "chosen", "rejected"))
-
-        # If dataset is not already preference-formatted, try loading from jsonl.
-        if (not train_pref) or not _has_pref_fields(train_pref[0]):
-            pref_path = getattr(self.model_config, "preference_pairs_path", None)
-            if pref_path is None or not os.path.exists(pref_path):
-                raise ValueError(
-                    "Preference pairs are missing. Set model_config.preference_pairs_path to a jsonl file "
-                    "with prompt/chosen/rejected fields, or ensure dataset.train_instances contain them."
-                )
-            loguru_logger.info("Loading preference pairs from %s", pref_path)
-            with open(pref_path, "r", encoding="utf-8") as f:
-                pref_data = [json.loads(line) for line in f if line.strip()]
-            if not pref_data:
-                raise ValueError(f"No preference pairs loaded from {pref_path}.")
-            dataset.set_instances(pref_data, [], [])
-            train_pref, dev_pref, _ = self.process_dataset(dataset)
+        # Data loading / preprocessing
+        train_pref, dev_pref = self._resolve_preference_splits(dataset)
 
         train_dataset, eval_dataset = self.prepare_preference_datasets(train_pref, dev_pref)
+        loguru_logger.info(
+            "DPO preference splits ready | train=%d eval=%d",
+            len(train_dataset),
+            len(eval_dataset) if eval_dataset is not None else 0,
+        )
 
+        # Model setup
         reference_model = self.prepare_reference_model(policy_model)
 
         max_length = getattr(self.model_config, "max_length", None)
         effective_max_length = max_length
-        if max_length is not None and hasattr(self.model, "config"):
-            model_max = getattr(self.model.config, "max_position_embeddings", max_length)
+        if max_length is not None and hasattr(policy_model, "config"):
+            model_max = getattr(policy_model.config, "max_position_embeddings", max_length)
             effective_max_length = min(model_max, max_length)
             if effective_max_length < max_length:
                 warnings.warn(
@@ -519,6 +643,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
         self.model_config.learning_rate = coerce_to_float(getattr(self.model_config, "learning_rate", 1e-5), 1e-5)
         self.model_config.weight_decay = coerce_to_float(getattr(self.model_config, "weight_decay", 0.0), 0.0)
 
+        # Trainer setup
         dpo_args = self.setup_dpo_config(do_eval=eval_dataset is not None,
                                          effective_max_length=effective_max_length,
                                          max_prompt_length=max_prompt_length)
@@ -535,6 +660,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
         setattr(dpo_trainer, "_policy_model_for_dpo", policy_model)
         setattr(dpo_trainer, "_reference_model_for_dpo", reference_model)
 
+        # Training / checkpointing
         dpo_trainer.train()
         dpo_trainer.save_model()
 
