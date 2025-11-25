@@ -562,7 +562,6 @@ class BayesAdaptiveLLMTrainer(Trainer):
         required_keys = {"prompt", "chosen", "rejected"}
         filtered_pairs = [row for row in preference_pairs if isinstance(row, dict) and required_keys.issubset(row)]
         dropped = len(preference_pairs) - len(filtered_pairs)
-        print("filtered pairs: ", filtered_pairs[:2])
         if dropped:
             loguru_logger.warning(
                 "Filtered out %d preference items missing required keys %s.", dropped, ", ".join(sorted(required_keys))
