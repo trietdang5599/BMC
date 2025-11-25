@@ -11,6 +11,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from safetensors.torch import load_file as safe_load_file
 from peft import PeftModel
+import re
 
 from base.model import Model
 
