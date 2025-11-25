@@ -4,8 +4,8 @@ Matches the interface of TRIPModel so the trainer/pipeline can be reused,
 and exposes a placeholder hook for MCTS-based preference scoring.
 """
 
-from typing import Path, Dict, Iterable, List, Optional, Tuple
-
+from typing import Dict, Iterable, List, Optional, Tuple
+from pathlib import Path
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
