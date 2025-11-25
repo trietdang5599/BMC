@@ -515,6 +515,19 @@ class BayesAdaptiveLLMTrainer(Trainer):
                     file_path = os.path.join(self.model_config.saved_dir, f"model.pth")
                 self.save_model(file_path)
 
+                if getattr(self.model_config, "save_hf_checkpoint", False):
+                    hf_subdir = getattr(self.model_config, "hf_checkpoint_subdir", "hf_checkpoint") or "hf_checkpoint"
+                    hf_dir = os.path.join(self.model_config.saved_dir, hf_subdir)
+                    os.makedirs(hf_dir, exist_ok=True)
+                    try:
+                        if hasattr(self.model, "plm"):
+                            self.model.plm.save_pretrained(hf_dir)
+                        if hasattr(self.model, "tokenizer"):
+                            self.model.tokenizer.save_pretrained(hf_dir)
+                        loguru_logger.info("Saved HF-format checkpoint for DPO at %s", hf_dir)
+                    except Exception as exc:
+                        loguru_logger.warning("Failed to export HF-format checkpoint to %s: %s", hf_dir, exc)
+
             if stop:
                 loguru_logger.info("Training process is completed.")
                 break

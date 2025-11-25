@@ -45,11 +45,13 @@ class BayesAdaptiveConfig(ModelConfig):
     optim = "adamw_torch"
     fp16 = False
     bf16 = True
+    save_hf_checkpoint = True
+    hf_checkpoint_subdir = "hf_checkpoint"
 
     # inference / prompting
     temperature = 0.7
     max_gen_tokens = 256
-    max_sequence_length = 512
+    max_sequence_length = 1024
 
     # DPO-related knobs
     dpo_beta = 0.1
