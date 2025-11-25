@@ -609,14 +609,12 @@ class BayesAdaptiveLLMTrainer(Trainer):
                     is_decoder = bool(getattr(cand_cfg, "is_decoder", False))
                     model_type = getattr(cand_cfg, "model_type", "")
                     if not is_decoder:
-                        loguru_logger.warning(
-                            "Found checkpoint at %s (model_type=%s) but it is not a decoder LM; ignoring for DPO init.",
-                            candidate,
-                            model_type,
+                        raise ValueError(
+                            f"SFT checkpoint at {candidate} has model_type={model_type} and is not a decoder LM. "
+                            "Please set dpo_model_path to a causal LM (e.g., GPT-style) or export a decoder checkpoint."
                         )
-                        candidate = None
                 except Exception as exc:
-                    loguru_logger.warning("Failed to read config from %s (%s); ignoring for DPO init.", candidate, exc)
+                    raise ValueError(f"Invalid SFT checkpoint at {candidate}: {exc}") from exc
             if candidate:
                 loguru_logger.info("Using SFT checkpoint at %s for DPO initialization.", candidate)
                 model_path = candidate
