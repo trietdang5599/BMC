@@ -704,6 +704,8 @@ class BayesAdaptiveLLMTrainer(Trainer):
         os.makedirs(adapter_dir, exist_ok=True)
         dpo_trainer.policy_model.save_pretrained(adapter_dir)
         tokenizer.save_pretrained(adapter_dir)
+        file_path = os.path.join(self.model_config.saved_dir, f"model_dpo.pth")
+        self.save_model(file_path)
         loguru_logger.info("Saved LoRA DPO adapter to %s", adapter_dir)
 
     def predict(self,
