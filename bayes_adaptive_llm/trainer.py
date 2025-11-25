@@ -24,7 +24,7 @@ from loguru import logger as loguru_logger
 from torch.optim import AdamW, Optimizer
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers.trainer_utils import IntervalStrategy
 
@@ -602,6 +602,24 @@ class BayesAdaptiveLLMTrainer(Trainer):
                     )
                 else:
                     loguru_logger.warning("Requested SFT checkpoint for DPO but no HF config.json found under saved_dir; falling back.")
+            # ensure candidate is a decoder-style LM; otherwise ignore and fallback
+            if candidate:
+                try:
+                    cand_cfg = AutoConfig.from_pretrained(candidate)
+                    is_decoder = bool(getattr(cand_cfg, "is_decoder", False))
+                    model_type = getattr(cand_cfg, "model_type", "")
+                    if not is_decoder:
+                        loguru_logger.warning(
+                            "Found checkpoint at %s (model_type=%s) but it is not a decoder LM; ignoring for DPO init.",
+                            candidate,
+                            model_type,
+                        )
+                        candidate = None
+                except Exception as exc:
+                    loguru_logger.warning("Failed to read config from %s (%s); ignoring for DPO init.", candidate, exc)
+            if candidate:
+                loguru_logger.info("Using SFT checkpoint at %s for DPO initialization.", candidate)
+                model_path = candidate
 
         if not model_path:
             model_path = getattr(self.model_config, "plm", "gpt2")
