@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from base.model import Model
 
@@ -24,7 +24,7 @@ class BayesAdaptiveLLMModel(Model):
             self.model_config.tokenizer,
             cache_dir=self.model_config.cached_dir,
         )
-        self.plm = AutoModel.from_pretrained(
+        self.plm = AutoModelForCausalLM.from_pretrained(
             self.model_config.plm,
             cache_dir=self.model_config.cached_dir,
         )
@@ -69,3 +69,7 @@ class BayesAdaptiveLLMModel(Model):
         if hasattr(self.plm, "gradient_checkpointing_disable"):
             return self.plm.gradient_checkpointing_disable()
         return None
+
+    # Minimal generate wrapper so TRL DPOTrainer can call into the underlying LM.
+    def generate(self, *args, **kwargs):
+        return self.plm.generate(*args, **kwargs)
