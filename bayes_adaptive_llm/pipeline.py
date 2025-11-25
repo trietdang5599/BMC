@@ -127,6 +127,9 @@ class BayesAdaptiveLLMPipeline(Pipeline):
         Supervised fine-tuning entrypoint.
         """
         return self.trainer.train_sft(self.dataset, self.device)
+    
+    def train_dpo(self):
+        return self.trainer.train_dpo(self.dataset, self.device)
 
     def inference(self, instance: Dict[str, Any], action_mapping=None):
         """
