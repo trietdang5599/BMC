@@ -50,7 +50,19 @@ class BayesAdaptiveLLMModel(Model):
         """
         Encode context with the PLM, take the [CLS] token and project to action logits.
         """
-        cls_token = self.plm(**batch["context"]).last_hidden_state[:, 0, :]
+        # Request hidden states so we can grab a stable representation from a causal LM.
+        outputs = self.plm(**batch["context"], output_hidden_states=True, use_cache=False)
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states:
+            cls_token = hidden_states[-1][:, 0, :]
+        else:
+            # Fallback: some implementations still expose last_hidden_state
+            cls_token = getattr(outputs, "last_hidden_state", None)
+            if cls_token is None:
+                # As a last resort, derive a pseudo-embedding from logits
+                cls_token = outputs.logits
+                if cls_token.dim() == 3:
+                    cls_token = cls_token[:, -1, :]
         cls_token = self.drop_out(cls_token)
         logits = self.out_layer(cls_token)
         return logits
