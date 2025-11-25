@@ -4,210 +4,38 @@ Matches the interface of TRIPModel so the trainer/pipeline can be reused,
 and exposes a placeholder hook for MCTS-based preference scoring.
 """
 
-from typing import Dict, Iterable, List, Optional, Tuple
-from pathlib import Path
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
+
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from safetensors.torch import load_file as safe_load_file
-from peft import PeftModel
-import re
+from transformers import AutoModel, AutoTokenizer
 
 from base.model import Model
 
 
 class BayesAdaptiveLLMModel(Model):
     """
-    Classification-style policy head on top of a PLM, plus minimal generate support for DPO.
+    Classification-style policy head on top of a PLM.
     """
+
     def __init__(self, model_config, **kwargs):
         super().__init__(model_config, **kwargs)
-
-        # Resolve model/tokenizer names from config.
-        model_name = getattr(model_config, "plm", "llama3")
-        tokenizer_name = getattr(model_config, "tokenizer", model_name)
-        trust_remote_code = getattr(model_config, "trust_remote_code", False)
-        stop_symbol = getattr(model_config, "stop_symbol", "\n")
-        input_max_len = getattr(model_config, "max_sequence_length", 512)
-        cuda = kwargs.get("cuda", True)
-        model_kwargs = kwargs.get("model_kwargs", None)
-
-        self.device = torch.device("cuda" if cuda and torch.cuda.is_available() else "cpu")
-        self.cuda = self.device.type == "cuda"
-        load_kwargs = model_kwargs.copy() if model_kwargs else {}
-        base_model_name = load_kwargs.pop("base_model_name_or_path", None)
-        adapter_path = Path(str(model_name))
-        is_adapter = adapter_path.exists() and (adapter_path / "adapter_config.json").exists()
-        if is_adapter:
-            if base_model_name is None:
-                raise ValueError(
-                    "Detected a PEFT/LoRA adapter at %s but no base model was provided. "
-                    "Set base_model_name_or_path in model config." % model_name
-                )
-            tokenizer_source = base_model_name
-        else:
-            tokenizer_source = tokenizer_name
-
         self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_source,
-            truncation_side="left",
-            trust_remote_code=trust_remote_code,
-            cache_dir=getattr(model_config, "cached_dir", None),
+            self.model_config.tokenizer,
+            cache_dir=self.model_config.cached_dir,
         )
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        # Extend vocabulary with task-specific tokens if provided.
-        special_tokens = getattr(self.model_config, "special_tokens_dict", None)
-        if special_tokens:
-            self.tokenizer.add_special_tokens(special_tokens)
+        self.plm = AutoModel.from_pretrained(
+            self.model_config.plm,
+            cache_dir=self.model_config.cached_dir,
+        )
 
-        if is_adapter:
-            base_model = AutoModelForCausalLM.from_pretrained(
-                tokenizer_source,
-                trust_remote_code=trust_remote_code,
-                torch_dtype=torch.bfloat16,
-                device_map=None,
-                cache_dir=getattr(model_config, "cached_dir", None),
-                **load_kwargs,
-            )
-            adapter_state = None
-            adapter_file = adapter_path / "adapter_model.safetensors"
-            if adapter_file.exists():
-                adapter_state = safe_load_file(str(adapter_file))
-            else:
-                adapter_file = adapter_path / "adapter_model.bin"
-                if adapter_file.exists():
-                    adapter_state = torch.load(adapter_file, map_location="cpu")
-            if adapter_state:
-                embed_key = next((k for k in adapter_state.keys() if k.endswith("embed_tokens.weight")), None)
-                if embed_key:
-                    adapter_vocab_size = adapter_state[embed_key].shape[0]
-                    base_vocab_size = base_model.get_input_embeddings().num_embeddings
-                    if adapter_vocab_size != base_vocab_size:
-                        base_model.resize_token_embeddings(adapter_vocab_size)
-            peft_model = PeftModel.from_pretrained(base_model, str(model_name))
-            try:
-                self.plm = peft_model.merge_and_unload()
-            except Exception:
-                self.plm = peft_model
-        else:
-            self.plm = AutoModelForCausalLM.from_pretrained(
-                str(model_name),
-                trust_remote_code=trust_remote_code,
-                torch_dtype=torch.bfloat16,
-                device_map=None,
-                cache_dir=getattr(model_config, "cached_dir", None),
-                **load_kwargs,
-            )
-        # Ensure embeddings match tokenizer size after special tokens.
-        try:
-            self.plm.resize_token_embeddings(len(self.tokenizer))
-        except Exception:
-            pass
-        self.plm.to(self.device)
-        self.plm.eval()
-        self.plm.config.pad_token_id = self.tokenizer.pad_token_id
-        stop_token_ids = self.tokenizer.encode(stop_symbol, add_special_tokens=False)
-        self.stop_token_id = stop_token_ids[-1] if len(stop_token_ids) > 0 else self.tokenizer.eos_token_id
-        self.input_max_len = input_max_len
-        self.default_chat_prefixes = {"assistant": "Assistant:", "user": "User:"}
-        self.inference_args = {
-            "max_new_tokens": 128,
-            "temperature": 0.7,
-            "repetition_penalty": 1.0,
-            "do_sample": True,
-            "num_return_sequences": 1,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.stop_token_id,
-        }
+        # extend vocabulary with task-specific tokens
+        self.tokenizer.add_special_tokens(self.model_config.special_tokens_dict)
+        self.plm.resize_token_embeddings(len(self.tokenizer))
 
-        # Classification head for policy logits.
         self.n_classes = self._infer_num_actions()
-        hidden_size = getattr(self.plm.config, "hidden_size", getattr(self.plm.config, "n_embd", None))
-        if hidden_size is None and hasattr(self.plm, "get_input_embeddings"):
-            hidden_size = self.plm.get_input_embeddings().embedding_dim
         self.drop_out = nn.Dropout(p=getattr(self.model_config, "dropout", 0.1))
-        self.out_layer = nn.Linear(hidden_size, self.n_classes)
-
-    def _prepare_generation_args(self, gen_args: Dict) -> Dict:
-        gen_params = {**self.inference_args}
-        gen_params.update(gen_args)
-        legacy_max = gen_params.pop("max_tokens", None)
-        if legacy_max is not None and gen_params.get("max_new_tokens") is None:
-            gen_params["max_new_tokens"] = legacy_max
-        legacy_num_ret = gen_params.pop("n", None)
-        if legacy_num_ret is not None and gen_params.get("num_return_sequences") is None:
-            gen_params["num_return_sequences"] = legacy_num_ret
-        for legacy in ("return_fulLocalModell_text", "echo", "stop"):
-            gen_params.pop(legacy, None)
-        if gen_params.get("num_return_sequences", 1) < 1:
-            gen_params["num_return_sequences"] = 1
-        if gen_params.get("num_return_sequences", 1) > 1 and not gen_params.get("do_sample", False):
-            gen_params["do_sample"] = True
-        if gen_params.get("pad_token_id") is None:
-            gen_params["pad_token_id"] = self.tokenizer.pad_token_id
-        if gen_params.get("eos_token_id") is None:
-            gen_params["eos_token_id"] = self.stop_token_id
-        return gen_params
-
-    def _messages_to_prompt(self, messages: List[Dict]) -> str:
-        if not messages:
-            return ""
-        prompt_lines: List[str] = []
-        assistant_prefix = None
-        user_prefix = None
-        for message in messages:
-            content = message.get("content", "").strip()
-            if not content:
-                continue
-            prompt_lines.append(content)
-            colon_idx = content.find(":")
-            if colon_idx != -1:
-                prefix = content[:colon_idx + 1]
-                if message.get("role") == "assistant":
-                    assistant_prefix = prefix
-                elif message.get("role") == "user":
-                    user_prefix = prefix
-        last_role = messages[-1].get("role")
-        if last_role == "user":
-            next_prefix = assistant_prefix or self.default_chat_prefixes["assistant"]
-        elif last_role == "assistant":
-            next_prefix = user_prefix or self.default_chat_prefixes["user"]
-        else:
-            next_prefix = assistant_prefix or self.default_chat_prefixes["assistant"]
-        prompt_lines.append(f"{next_prefix} ")
-        return "\n".join(prompt_lines)
-
-    def generate_text(self, input_text: str, **gen_args):
-        gen_params = self._prepare_generation_args(gen_args)
-        inputs = self.tokenizer([input_text], return_tensors='pt', truncation=True, max_length=self.input_max_len)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        prompt_len = inputs['input_ids'].shape[-1]
-
-        with torch.no_grad():
-            try:
-                outputs = self.plm.generate(**inputs, **gen_params)
-            except ValueError as exc:
-                msg = str(exc)
-                if "not used by the model" in msg:
-                    unused = re.findall(r"'([^']+)'", msg)
-                    stripped_any = False
-                    for key in unused:
-                        if key in gen_params:
-                            gen_params.pop(key, None)
-                            stripped_any = True
-                    if stripped_any:
-                        outputs = self.plm.generate(**inputs, **gen_params)
-                    else:
-                        raise
-                else:
-                    raise
-        gen_only_outputs = outputs[:, prompt_len:].detach().cpu()
-        gen_resps = self.tokenizer.batch_decode(gen_only_outputs, skip_special_tokens=True)
-        gen_output = []
-        for resp in gen_resps:
-            gen_output.append({"generated_text": resp})
-        return gen_output
+        self.out_layer = nn.Linear(self.model_config.lm_size, self.n_classes)
 
     def _infer_num_actions(self) -> int:
         n_goals = getattr(self.model_config, "n_goals", 1)
@@ -218,43 +46,18 @@ class BayesAdaptiveLLMModel(Model):
         """
         Encode context with the PLM, take the [CLS] token and project to action logits.
         """
-        # Request hidden states so we can grab a stable representation from a causal LM.
-        outputs = self.plm(**batch["context"], output_hidden_states=True, use_cache=False)
-        hidden_states = getattr(outputs, "hidden_states", None)
-        if hidden_states:
-            cls_token = hidden_states[-1][:, 0, :]
-        else:
-            # Fallback: some implementations still expose last_hidden_state
-            cls_token = getattr(outputs, "last_hidden_state", None)
-            if cls_token is None:
-                # As a last resort, derive a pseudo-embedding from logits
-                cls_token = outputs.logits
-                if cls_token.dim() == 3:
-                    cls_token = cls_token[:, -1, :]
-        # Align dtype with classifier weights to avoid mixed-precision matmul issues.
-        cls_token = cls_token.to(self.out_layer.weight.dtype)
+        cls_token = self.plm(**batch["context"]).last_hidden_state[:, 0, :]
         cls_token = self.drop_out(cls_token)
         logits = self.out_layer(cls_token)
         return logits
 
-    # Expose embedding accessors expected by TRL trainers.
-    def get_input_embeddings(self):
-        return self.plm.get_input_embeddings()
-
-    def set_input_embeddings(self, new_embeddings):
-        self.plm.set_input_embeddings(new_embeddings)
-
-    # Expose gradient checkpointing toggles expected by HF trainers.
-    def gradient_checkpointing_enable(self, **kwargs):
-        if hasattr(self.plm, "gradient_checkpointing_enable"):
-            return self.plm.gradient_checkpointing_enable(**kwargs)
-        return None
-
-    def gradient_checkpointing_disable(self):
-        if hasattr(self.plm, "gradient_checkpointing_disable"):
-            return self.plm.gradient_checkpointing_disable()
-        return None
-
-    # Minimal generate wrapper so TRL DPOTrainer can call into the underlying LM.
-    def generate(self, *args, **kwargs):
-        return self.plm.generate(*args, **kwargs)
+    def score_candidates(self,
+                         dialogue_context: Sequence[Dict[str, Any]],
+                         candidates: Sequence[str],
+                         **kwargs) -> torch.Tensor:
+        """
+        Placeholder hook for future MCTS preference scoring.
+        Given a dialogue context and multiple candidate actions/responses,
+        return a tensor of scores so an MCTS loop can pick the highest-valued sample.
+        """
+        raise NotImplementedError("Candidate scoring for MCTS has not been implemented yet.")

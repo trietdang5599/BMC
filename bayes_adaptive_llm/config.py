@@ -29,6 +29,9 @@ class BayesAdaptiveConfig(ModelConfig):
     run_offline_eval = False
     run_online_eval = False
 
+    # preference data
+    preference_pairs_path = None
+
     # optimisation
     batch_size = 4
     gradient_accumulation = 1
@@ -47,6 +50,13 @@ class BayesAdaptiveConfig(ModelConfig):
 
     # DPO-related knobs
     dpo_beta = 0.1
+    dpo_model_path = "gpt2"
+    dpo_adapter_path = None
+    dpo_epochs = 3
+    dpo_batch_size = 2
+    dpo_learning_rate = 5e-5
+    dpo_max_length = 512
+    dpo_use_wandb = False
     max_length = None
     max_prompt_length = None
     fp16 = False

@@ -17,12 +17,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import tqdm
 from datasets import Dataset as HFDataset
 from loguru import logger as loguru_logger
 from torch.optim import AdamW, Optimizer
-from torch.utils.data import DataLoader
-from transformers import get_linear_schedule_with_warmup
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers.trainer_utils import IntervalStrategy
 
 try:
@@ -90,6 +93,169 @@ def cuda_bf16_supported() -> bool:
     except Exception:
         return False
     return major >= 8
+
+
+class PreferenceDPODataset(Dataset):
+    """
+    Minimal DPO dataset for prompt / chosen / rejected triples.
+    """
+
+    def __init__(self, data: List[Dict[str, Any]], tokenizer, max_length: int = 512):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        item = self.data[idx]
+        prompt_enc = self.tokenizer(
+            item["prompt"], truncation=True, max_length=self.max_length // 3, return_tensors="pt"
+        )
+        chosen_enc = self.tokenizer(
+            item["chosen"], truncation=True, max_length=self.max_length // 3, return_tensors="pt"
+        )
+        rejected_enc = self.tokenizer(
+            item["rejected"], truncation=True, max_length=self.max_length // 3, return_tensors="pt"
+        )
+
+        return {
+            "prompt_input_ids": prompt_enc["input_ids"].squeeze(0),
+            "prompt_attention_mask": prompt_enc["attention_mask"].squeeze(0),
+            "chosen_input_ids": chosen_enc["input_ids"].squeeze(0),
+            "chosen_attention_mask": chosen_enc["attention_mask"].squeeze(0),
+            "rejected_input_ids": rejected_enc["input_ids"].squeeze(0),
+            "rejected_attention_mask": rejected_enc["attention_mask"].squeeze(0),
+            "chosen_score": torch.tensor(item.get("chosen_score", 0.9), dtype=torch.float32),
+            "rejected_score": torch.tensor(item.get("rejected_score", 0.2), dtype=torch.float32),
+        }
+
+    def collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        def _pad(seqs, pad_val):
+            return pad_sequence(seqs, batch_first=True, padding_value=pad_val)
+
+        def _pad_mask(masks):
+            return pad_sequence(masks, batch_first=True, padding_value=0)
+
+        pad_id = self.tokenizer.pad_token_id
+        prompt_input_ids = _pad([item["prompt_input_ids"] for item in batch], pad_id)
+        prompt_attention_mask = _pad_mask([item["prompt_attention_mask"] for item in batch])
+        chosen_input_ids = _pad([item["chosen_input_ids"] for item in batch], pad_id)
+        chosen_attention_mask = _pad_mask([item["chosen_attention_mask"] for item in batch])
+        rejected_input_ids = _pad([item["rejected_input_ids"] for item in batch], pad_id)
+        rejected_attention_mask = _pad_mask([item["rejected_attention_mask"] for item in batch])
+        chosen_score = torch.stack([item["chosen_score"] for item in batch])
+        rejected_score = torch.stack([item["rejected_score"] for item in batch])
+
+        return {
+            "prompt_input_ids": prompt_input_ids,
+            "prompt_attention_mask": prompt_attention_mask,
+            "chosen_input_ids": chosen_input_ids,
+            "chosen_attention_mask": chosen_attention_mask,
+            "rejected_input_ids": rejected_input_ids,
+            "rejected_attention_mask": rejected_attention_mask,
+            "chosen_score": chosen_score,
+            "rejected_score": rejected_score,
+        }
+
+
+class PreferenceDPOTrainer:
+    """
+    Lightweight DPO trainer with LoRA adapters.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        tokenizer,
+        device: torch.device,
+        learning_rate: float = 5e-5,
+        beta: float = 0.1,
+    ):
+        self.device = device
+        self.tokenizer = tokenizer
+        self.beta = beta
+
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        device_map = "auto" if torch.cuda.is_available() else None
+
+        policy_model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=dtype, device_map=device_map, trust_remote_code=True
+        )
+        policy_model = self._ensure_padding(policy_model)
+        if device_map is None:
+            policy_model = policy_model.to(device)
+
+        lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=16, lora_dropout=0.05)
+        self.policy_model = get_peft_model(policy_model, lora_config)
+
+        reference_model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=dtype, device_map=device_map, trust_remote_code=True
+        )
+        self.reference_model = self._ensure_padding(reference_model)
+        if device_map is None:
+            self.reference_model = self.reference_model.to(device)
+
+        self.optimizer = torch.optim.AdamW(self.policy_model.parameters(), lr=learning_rate)
+
+    def _ensure_padding(self, model):
+        if model.config.pad_token_id is None:
+            model.config.pad_token_id = self.tokenizer.eos_token_id
+        return model
+
+    def compute_log_probs(self, model, input_ids, attention_mask=None):
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        log_probs = F.log_softmax(logits, dim=-1)
+        token_log_probs = torch.gather(log_probs, -1, input_ids.unsqueeze(-1)).squeeze(-1)
+
+        if attention_mask is not None:
+            token_log_probs = token_log_probs * attention_mask
+
+        seq_log_probs = token_log_probs.sum(dim=-1) / (attention_mask.sum(dim=-1) + 1e-8)
+        return seq_log_probs
+
+    def dpo_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        prompt_input_ids = batch["prompt_input_ids"].to(self.device)
+        prompt_attention_mask = batch["prompt_attention_mask"].to(self.device)
+        chosen_input_ids = batch["chosen_input_ids"].to(self.device)
+        chosen_attention_mask = batch["chosen_attention_mask"].to(self.device)
+        rejected_input_ids = batch["rejected_input_ids"].to(self.device)
+        rejected_attention_mask = batch["rejected_attention_mask"].to(self.device)
+
+        chosen_full_input_ids = torch.cat([prompt_input_ids, chosen_input_ids], dim=1)
+        chosen_full_attention_mask = torch.cat([prompt_attention_mask, chosen_attention_mask], dim=1)
+        rejected_full_input_ids = torch.cat([prompt_input_ids, rejected_input_ids], dim=1)
+        rejected_full_attention_mask = torch.cat([prompt_attention_mask, rejected_attention_mask], dim=1)
+
+        chosen_policy_log_probs = self.compute_log_probs(
+            self.policy_model, chosen_full_input_ids, chosen_full_attention_mask
+        )
+        rejected_policy_log_probs = self.compute_log_probs(
+            self.policy_model, rejected_full_input_ids, rejected_full_attention_mask
+        )
+
+        with torch.no_grad():
+            chosen_ref_log_probs = self.compute_log_probs(
+                self.reference_model, chosen_full_input_ids, chosen_full_attention_mask
+            )
+            rejected_ref_log_probs = self.compute_log_probs(
+                self.reference_model, rejected_full_input_ids, rejected_full_attention_mask
+            )
+
+        chosen_ratio = chosen_policy_log_probs - chosen_ref_log_probs
+        rejected_ratio = rejected_policy_log_probs - rejected_ref_log_probs
+        losses = -F.logsigmoid(self.beta * (chosen_ratio - rejected_ratio))
+        return losses.mean()
+
+    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
+        self.policy_model.train()
+        loss = self.dpo_loss(batch)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return float(loss.item())
 
 
 class BayesAdaptiveLLMTrainer(Trainer):
@@ -285,232 +451,6 @@ class BayesAdaptiveLLMTrainer(Trainer):
         return results
 
 #region Preparation for DPO training
-    def _normalize_persona_hint(self, persona_hint: Any) -> Dict[str, str]:
-        """
-        Normalize persona hints so the formatter can safely prepend them to prompts.
-        Accepts dicts with expected keys, loose dicts, strings, or None.
-        """
-        if persona_hint is None:
-            return {}
-        if isinstance(persona_hint, str):
-            return {"personality": persona_hint}
-        if not isinstance(persona_hint, dict):
-            return {}
-
-        normalized: Dict[str, str] = {}
-        if persona_hint.get("personality"):
-            normalized["personality"] = str(persona_hint["personality"])
-        if persona_hint.get("decision_making_style"):
-            normalized["decision_making_style"] = str(persona_hint["decision_making_style"])
-        # fallbacks for legacy keys
-        if not normalized and persona_hint.get("description"):
-            normalized["personality"] = str(persona_hint["description"])
-        return normalized
-
-    def _format_prompt_with_persona(self, prompt: str, persona_hint: Any) -> Tuple[str, Dict[str, str]]:
-        """
-        Inject persona hints (if provided) into the prompt so policy and reference
-        models see consistent conditioning signals.
-        """
-        normalized_persona = self._normalize_persona_hint(persona_hint)
-        if not prompt:
-            raise ValueError("Preference example is missing a prompt.")
-
-        if not normalized_persona:
-            return prompt, {}
-
-        persona_lines: List[str] = []
-        if normalized_persona.get("personality"):
-            persona_lines.append(f"Persona: {normalized_persona['personality']}")
-        if normalized_persona.get("decision_making_style"):
-            persona_lines.append(f"Decision-making style: {normalized_persona['decision_making_style']}")
-
-        persona_block = "Persona hint:\n" + "\n".join(f"- {line}" for line in persona_lines)
-        formatted_prompt = f"{persona_block}\n\n{prompt}"
-        return formatted_prompt, normalized_persona
-
-    def _preference_example_to_row(self, example: Any, idx: int) -> Dict[str, Any]:
-        """
-        Convert a raw preference example into the schema consumed by TRL.
-        Ensures persona hints are folded into the prompt while retaining metadata.
-        """
-        def _get(field: str, default=None):
-            if isinstance(example, dict):
-                return example.get(field, default)
-            return getattr(example, field, default)
-
-        prompt = _get("prompt")
-        chosen = _get("chosen")
-        rejected = _get("rejected")
-        if prompt is None or chosen is None or rejected is None:
-            raise ValueError("Preference example must contain prompt, chosen and rejected fields.")
-
-        dialog_id = _get("dialog_id", idx)
-        persona_hint = _get("persona_hint")
-        formatted_prompt, normalized_persona = self._format_prompt_with_persona(prompt, persona_hint)
-
-        return {
-            "dialog_id": dialog_id,
-            "prompt": formatted_prompt,
-            "raw_prompt": prompt,
-            "chosen": chosen,
-            "rejected": rejected,
-            "persona_hint": normalized_persona or None,
-        }
-
-    def _preference_split_is_ready(self, pref_split: Sequence[Any]) -> bool:
-        """
-        Check whether a preference split already follows the expected schema.
-        """
-        if not pref_split:
-            return False
-        sample = pref_split[0]
-        if isinstance(sample, dict):
-            return all(k in sample for k in ("prompt", "chosen", "rejected"))
-        return all(hasattr(sample, k) for k in ("prompt", "chosen", "rejected"))
-
-    def _load_preference_pairs_from_path(self, pref_path: str) -> List[Dict[str, Any]]:
-        """
-        Load preference pairs from json/jsonl on disk adhering to the new schema.
-        """
-        if not pref_path:
-            raise ValueError("Preference path is not provided for DPO training.")
-        if not os.path.exists(pref_path):
-            raise FileNotFoundError(f"Preference pairs path does not exist: {pref_path}")
-
-        data: List[Dict[str, Any]]
-        if pref_path.endswith(".jsonl"):
-            with open(pref_path, "r", encoding="utf-8") as f:
-                data = [json.loads(line) for line in f if line.strip()]
-        else:
-            with open(pref_path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                # allow wrapped payloads e.g., {"data": [...]} for flexibility
-                data = loaded.get("data") or loaded.get("examples") or []
-                if not data and isinstance(loaded.get("train"), list):
-                    data = loaded["train"]
-            else:
-                data = loaded
-
-        if not isinstance(data, list) or not data:
-            raise ValueError(f"No preference pairs loaded from {pref_path}.")
-        loguru_logger.info("Loaded %d preference pairs from %s", len(data), pref_path)
-        return data
-
-    def _resolve_preference_splits(self, dataset) -> Tuple[List[Any], List[Any]]:
-        """
-        Choose preference data from the in-memory dataset or fall back to the path
-        configured in model_config.preference_pairs_path. Updates the dataset in-place
-        when loading from disk to keep downstream code consistent.
-        """
-        train_pref, dev_pref, _ = self.process_dataset(dataset)
-        if self._preference_split_is_ready(train_pref):
-            return train_pref, dev_pref
-
-        pref_path = getattr(self.model_config, "preference_pairs_path", None)
-        pref_data = self._load_preference_pairs_from_path(pref_path)
-        dataset.set_instances(pref_data, [], [])
-        train_pref, dev_pref, _ = self.process_dataset(dataset)
-        return train_pref, dev_pref
-
-    def prepare_preference_datasets(self, train_pref: List[Any], val_pref: Optional[List[Any]] = None):
-        """
-        Build Hugging Face datasets for DPOTrainer from raw preference rows.
-        """
-        if not train_pref:
-            raise ValueError("No preference examples available for training.")
-
-        rng = random.Random(getattr(self.model_config, "seed", 42))
-        rng.shuffle(train_pref)
-
-        max_samples = getattr(self.model_config, "max_samples", None)
-        if max_samples is not None and max_samples > 0:
-            train_pref = train_pref[:max_samples]
-
-        if val_pref:
-            warnings.warn(
-                "Provided validation preference set is ignored; deriving validation split from training data.",
-                RuntimeWarning,
-            )
-
-        validation_ratio = getattr(self.model_config, "validation_ratio", 0.0)
-        val_size = int(len(train_pref) * validation_ratio)
-        eval_pref = train_pref[:val_size] if val_size > 0 else []
-        train_pref = train_pref[val_size:]
-        if not train_pref:
-            raise ValueError("Not enough preference examples for training after validation split.")
-
-        train_rows = [self._preference_example_to_row(ex, idx) for idx, ex in enumerate(train_pref)]
-        eval_rows = [self._preference_example_to_row(ex, idx) for idx, ex in enumerate(eval_pref)] if eval_pref else []
-
-        persona_coverage = sum(1 for row in train_rows if row["persona_hint"]) / len(train_rows)
-        loguru_logger.info(
-            "Prepared DPO datasets | train=%d eval=%d | persona hints on %.1f%% of train rows",
-            len(train_rows),
-            len(eval_rows),
-            persona_coverage * 100,
-        )
-
-        train_dataset = HFDataset.from_list(train_rows)
-        eval_dataset = HFDataset.from_list(eval_rows) if eval_rows else None
-        return train_dataset, eval_dataset
-
-    def setup_dpo_config(self, do_eval: bool, effective_max_length: Optional[int], max_prompt_length: Optional[int]) -> DPOConfig:
-        if DPOConfig is None:
-            raise ImportError("trl is required for DPO training. Install it with `pip install trl`.")
-
-        output_dir = getattr(self.model_config, "output_dir", getattr(self.model_config, "saved_dir", "."))
-        batch_size = getattr(self.model_config, "batch_size", getattr(self.model_config, "per_device_train_batch_size", 1))
-
-        return DPOConfig(
-            output_dir=str(output_dir),
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            gradient_accumulation_steps=getattr(self.model_config, "gradient_accumulation", getattr(self.model_config, "gradient_accumulation_steps", 1)),
-            learning_rate=self.model_config.learning_rate,
-            num_train_epochs=self.model_config.num_train_epochs,
-            weight_decay=self.model_config.weight_decay,
-            warmup_ratio=self.model_config.warmup_ratio,
-            logging_steps=self.model_config.logging_steps,
-            eval_strategy=IntervalStrategy.EPOCH if do_eval else IntervalStrategy.NO,
-            save_strategy=IntervalStrategy.EPOCH,
-            save_total_limit=self.model_config.save_total_limit,
-            report_to=[],
-            fp16=getattr(self.model_config, "fp16", False) and torch.cuda.is_available(),
-            bf16=getattr(self.model_config, "bf16", False) and cuda_bf16_supported(),
-            remove_unused_columns=False,
-            beta=getattr(self.model_config, "dpo_beta", 0.1),
-            max_length=effective_max_length,
-            max_prompt_length=max_prompt_length,
-            gradient_checkpointing=getattr(self.model_config, "gradient_checkpointing", False),
-            ddp_find_unused_parameters=False,
-            do_train=True,
-            do_eval=do_eval,
-            optim="adamw_torch",
-        )
-
-    def prepare_reference_model(self, policy_model=None):
-        """
-        Resolve or create the frozen reference model for DPO training.
-        """
-        reference_model = getattr(self.model_config, "reference_model", None)
-        if reference_model is None:
-            target = policy_model if policy_model is not None else self.model
-            # Default to a frozen copy of the current (policy) model if none is provided.
-            loguru_logger.warning("reference_model not provided; cloning current model for DPO.")
-            reference_model = copy.deepcopy(target)
-            # cache on config so repeated calls reuse the same copy
-            setattr(self.model_config, "reference_model", reference_model)
-        reference_model.requires_grad_(False)
-        reference_model.eval()
-        return reference_model
-
-    def _resolve_policy_model(self):
-        """
-        Ensure DPOTrainer receives the causal LM (not the policy wrapper).
-        """
-        return getattr(self.model, "plm", self.model)
 #endregion
 
     def train_sft(self, dataset, device: Optional[torch.device] = None) -> None:
@@ -596,80 +536,86 @@ class BayesAdaptiveLLMTrainer(Trainer):
 
     def train_dpo(self, dataset, device: Optional[torch.device] = None) -> None:
         """
-        Train the policy using Direct Preference Optimisation on the new persona-aware schema.
+        Preference-based DPO fine-tuning with a lightweight LoRA adapter.
+        Expects dataset.train_instances to contain dictionaries with keys:
+        - prompt
+        - chosen
+        - rejected
+        Optionally reads from `model_config.preference_pairs_path` if the dataset is empty.
         """
-        if DPOTrainer is None or DPOConfig is None:
-            raise ImportError("trl is required for DPO training. Install it with `pip install trl`.")
+        device = device or getattr(self, "device", None) or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Patch TRL DPOTrainer to accept the extra `device` arg newer transformers passes.
-        _patch_dpo_trainer_get_batch_samples()
+        preference_pairs: List[Dict[str, Any]] = list(getattr(dataset, "train_instances", []) or [])
+        if not preference_pairs:
+            pref_path = getattr(self.model_config, "preference_pairs_path", None)
+            if pref_path and os.path.exists(pref_path):
+                with open(pref_path, "r", encoding="utf-8") as handle:
+                    if pref_path.endswith(".jsonl"):
+                        preference_pairs = [json.loads(line) for line in handle if line.strip()]
+                    else:
+                        preference_pairs = json.load(handle)
 
-        policy_model = self._resolve_policy_model()
+        if not preference_pairs:
+            loguru_logger.warning("No preference pairs available for DPO training; skipping.")
+            return
 
-        # Data loading / preprocessing
-        train_pref, dev_pref = self._resolve_preference_splits(dataset)
+        model_path = getattr(self.model_config, "dpo_model_path", getattr(self.model_config, "plm", "gpt2"))
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        max_length = getattr(self.model_config, "dpo_max_length", 512)
+        batch_size = getattr(self.model_config, "dpo_batch_size", 2)
+        epochs = getattr(self.model_config, "dpo_epochs", 3)
+        learning_rate = getattr(self.model_config, "dpo_learning_rate", 5e-5)
+        beta = getattr(self.model_config, "dpo_beta", 0.1)
 
-        train_dataset, eval_dataset = self.prepare_preference_datasets(train_pref, dev_pref)
+        dpo_dataset = PreferenceDPODataset(preference_pairs, tokenizer, max_length=max_length)
+        dataloader = DataLoader(
+            dpo_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=dpo_dataset.collate_fn,
+        )
+
+        dpo_trainer = PreferenceDPOTrainer(
+            model_path=model_path,
+            tokenizer=tokenizer,
+            device=device,
+            learning_rate=learning_rate,
+            beta=beta,
+        )
+
+        disable_tqdm = False
+        if hasattr(self, "accelerator"):
+            disable_tqdm = not self.accelerator.is_local_main_process
+
         loguru_logger.info(
-            "DPO preference splits ready | train=%d eval=%d",
-            len(train_dataset),
-            len(eval_dataset) if eval_dataset is not None else 0,
+            "Starting DPO training: %d pairs, epochs=%d, batch_size=%d, lr=%.1e, beta=%.2f",
+            len(dpo_dataset),
+            epochs,
+            batch_size,
+            learning_rate,
+            beta,
         )
 
-        # Model setup
-        reference_model = self.prepare_reference_model(policy_model)
+        for epoch in range(epochs):
+            step_losses: List[float] = []
+            progress = tqdm.tqdm(dataloader, disable=disable_tqdm, desc=f"DPO epoch {epoch+1}/{epochs}")
+            for batch in progress:
+                loss = dpo_trainer.train_step(batch)
+                step_losses.append(loss)
+                progress.set_postfix(loss=loss)
 
-        max_length = getattr(self.model_config, "max_length", None)
-        effective_max_length = max_length
-        if max_length is not None and hasattr(policy_model, "config"):
-            model_max = getattr(policy_model.config, "max_position_embeddings", max_length)
-            effective_max_length = min(model_max, max_length)
-            if effective_max_length < max_length:
-                warnings.warn(
-                    f"Requested max_length={max_length} exceeds model capacity ({model_max}). "
-                    f"Using {effective_max_length} instead.",
-                    RuntimeWarning,
-                )
+            avg_loss = float(np.mean(step_losses)) if step_losses else 0.0
+            loguru_logger.info("Epoch %d completed. Avg loss: %.4f", epoch + 1, avg_loss)
 
-        max_prompt_length = getattr(self.model_config, "max_prompt_length", None)
-        if max_prompt_length is None and effective_max_length is not None:
-            max_prompt_length = effective_max_length
-        elif max_prompt_length is not None and effective_max_length is not None:
-            max_prompt_length = min(max_prompt_length, effective_max_length)
-
-        # Ensure numeric hyperparameters before building DPO args.
-        self.model_config.learning_rate = coerce_to_float(getattr(self.model_config, "learning_rate", 1e-5), 1e-5)
-        self.model_config.weight_decay = coerce_to_float(getattr(self.model_config, "weight_decay", 0.0), 0.0)
-
-        # Trainer setup
-        dpo_args = self.setup_dpo_config(do_eval=eval_dataset is not None,
-                                         effective_max_length=effective_max_length,
-                                         max_prompt_length=max_prompt_length)
-
-        dpo_trainer = DPOTrainer(
-            policy_model,
-            reference_model,
-            args=dpo_args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            tokenizer=self.tokenizer,
-        )
-        # Stash the raw causal LM and reference so patched get_batch_samples uses them.
-        setattr(dpo_trainer, "_policy_model_for_dpo", policy_model)
-        setattr(dpo_trainer, "_reference_model_for_dpo", reference_model)
-
-        # Training / checkpointing
-        dpo_trainer.train()
-        dpo_trainer.save_model()
-
-        output_dir = getattr(self.model_config, "output_dir", getattr(self.model_config, "saved_dir", "."))
-        os.makedirs(output_dir, exist_ok=True)
-        if hasattr(policy_model, "save_pretrained"):
-            policy_model.save_pretrained(output_dir)
-        else:
-            self.save_model(os.path.join(output_dir, "model.pth"))
-        if self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
-            self.tokenizer.save_pretrained(output_dir)
+        adapter_dir = getattr(self.model_config, "dpo_adapter_path", None)
+        if not adapter_dir:
+            adapter_dir = os.path.join(self.model_config.saved_dir, "dpo_adapter")
+        os.makedirs(adapter_dir, exist_ok=True)
+        dpo_trainer.policy_model.save_pretrained(adapter_dir)
+        tokenizer.save_pretrained(adapter_dir)
+        loguru_logger.info("Saved LoRA DPO adapter to %s", adapter_dir)
 
     def predict(self,
                 instance: Dict[str, Any],
