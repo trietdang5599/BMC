@@ -73,6 +73,12 @@ def _patch_dpo_trainer_get_batch_samples() -> None:
                 self.model = self._policy_model_for_dpo
             except Exception:
                 pass
+        # Also ensure reference model is the raw LM if stashed.
+        if hasattr(self, "_reference_model_for_dpo"):
+            try:
+                self.ref_model = self._reference_model_for_dpo
+            except Exception:
+                pass
         return original_get_batch_samples(self, iterator, num_batches)
 
     DPOTrainer.get_batch_samples = _wrapped
@@ -525,8 +531,9 @@ class BayesAdaptiveLLMTrainer(Trainer):
             eval_dataset=eval_dataset,
             tokenizer=self.tokenizer,
         )
-        # Stash the raw causal LM so patched get_batch_samples uses it.
+        # Stash the raw causal LM and reference so patched get_batch_samples uses them.
         setattr(dpo_trainer, "_policy_model_for_dpo", policy_model)
+        setattr(dpo_trainer, "_reference_model_for_dpo", reference_model)
 
         dpo_trainer.train()
         dpo_trainer.save_model()
