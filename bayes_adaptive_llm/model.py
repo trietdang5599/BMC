@@ -24,6 +24,9 @@ class BayesAdaptiveLLMModel(Model):
             self.model_config.tokenizer,
             cache_dir=self.model_config.cached_dir,
         )
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         self.plm = AutoModelForCausalLM.from_pretrained(
             self.model_config.plm,
             cache_dir=self.model_config.cached_dir,

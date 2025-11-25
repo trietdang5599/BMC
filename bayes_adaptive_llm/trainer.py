@@ -350,12 +350,13 @@ class BayesAdaptiveLLMTrainer(Trainer):
             optim="adamw_torch",
         )
 
-    def prepare_reference_model(self):
+    def prepare_reference_model(self, policy_model=None):
         reference_model = getattr(self.model_config, "reference_model", None)
         if reference_model is None:
-            # Default to a frozen copy of the current model if none is provided.
+            target = policy_model if policy_model is not None else self.model
+            # Default to a frozen copy of the current (policy) model if none is provided.
             loguru_logger.warning("reference_model not provided; cloning current model for DPO.")
-            reference_model = copy.deepcopy(self.model)
+            reference_model = copy.deepcopy(target)
             # cache on config so repeated calls reuse the same copy
             setattr(self.model_config, "reference_model", reference_model)
         reference_model.requires_grad_(False)
@@ -454,6 +455,9 @@ class BayesAdaptiveLLMTrainer(Trainer):
         # Patch TRL DPOTrainer to accept the extra `device` arg newer transformers passes.
         _patch_dpo_trainer_get_batch_samples()
 
+        # Ensure we hand DPOTrainer a causal LM with generate(), not the policy wrapper.
+        policy_model = getattr(self.model, "plm", self.model)
+
         train_pref, dev_pref, _ = self.process_dataset(dataset)
 
         def _has_pref_fields(ex: Any) -> bool:
@@ -479,7 +483,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
 
         train_dataset, eval_dataset = self.prepare_preference_datasets(train_pref, dev_pref)
 
-        reference_model = self.prepare_reference_model()
+        reference_model = self.prepare_reference_model(policy_model)
 
         max_length = getattr(self.model_config, "max_length", None)
         effective_max_length = max_length
@@ -508,7 +512,7 @@ class BayesAdaptiveLLMTrainer(Trainer):
                                          max_prompt_length=max_prompt_length)
 
         dpo_trainer = DPOTrainer(
-            self.model,
+            policy_model,
             reference_model,
             args=dpo_args,
             train_dataset=train_dataset,
@@ -521,8 +525,8 @@ class BayesAdaptiveLLMTrainer(Trainer):
 
         output_dir = getattr(self.model_config, "output_dir", getattr(self.model_config, "saved_dir", "."))
         os.makedirs(output_dir, exist_ok=True)
-        if hasattr(self.model, "save_pretrained"):
-            self.model.save_pretrained(output_dir)
+        if hasattr(policy_model, "save_pretrained"):
+            policy_model.save_pretrained(output_dir)
         else:
             self.save_model(os.path.join(output_dir, "model.pth"))
         if self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
