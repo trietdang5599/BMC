@@ -18,41 +18,48 @@ from base.model import Model
 
 class BayesAdaptiveLLMModel(Model):
     """
-    Classification-style policy head on top of a PLM.
+    Classification-style policy head on top of a PLM, plus minimal generate support for DPO.
     """
-    def __init__(
-        self,
-        model_name: str = "llama3",
-        input_max_len: int = 512,
-        stop_symbol: str = "\n",
-        cuda: bool = True,
-        trust_remote_code: bool = False,
-        model_kwargs: Optional[Dict] = None,
-    ):
-        
+    def __init__(self, model_config, **kwargs):
+        super().__init__(model_config, **kwargs)
+
+        # Resolve model/tokenizer names from config.
+        model_name = getattr(model_config, "plm", "llama3")
+        tokenizer_name = getattr(model_config, "tokenizer", model_name)
+        trust_remote_code = getattr(model_config, "trust_remote_code", False)
+        stop_symbol = getattr(model_config, "stop_symbol", "\n")
+        input_max_len = getattr(model_config, "max_sequence_length", 512)
+        cuda = kwargs.get("cuda", True)
+        model_kwargs = kwargs.get("model_kwargs", None)
+
         self.device = torch.device("cuda" if cuda and torch.cuda.is_available() else "cpu")
         self.cuda = self.device.type == "cuda"
         load_kwargs = model_kwargs.copy() if model_kwargs else {}
         base_model_name = load_kwargs.pop("base_model_name_or_path", None)
-        adapter_path = Path(model_name)
+        adapter_path = Path(str(model_name))
         is_adapter = adapter_path.exists() and (adapter_path / "adapter_config.json").exists()
         if is_adapter:
             if base_model_name is None:
                 raise ValueError(
                     "Detected a PEFT/LoRA adapter at %s but no base model was provided. "
-                    "Set --local-base-model when running GDPZero." % model_name
+                    "Set base_model_name_or_path in model config." % model_name
                 )
             tokenizer_source = base_model_name
         else:
-            tokenizer_source = model_name
+            tokenizer_source = tokenizer_name
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_source,
             truncation_side="left",
             trust_remote_code=trust_remote_code,
+            cache_dir=getattr(model_config, "cached_dir", None),
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Extend vocabulary with task-specific tokens if provided.
+        special_tokens = getattr(self.model_config, "special_tokens_dict", None)
+        if special_tokens:
+            self.tokenizer.add_special_tokens(special_tokens)
 
         if is_adapter:
             base_model = AutoModelForCausalLM.from_pretrained(
@@ -60,6 +67,7 @@ class BayesAdaptiveLLMModel(Model):
                 trust_remote_code=trust_remote_code,
                 torch_dtype=torch.bfloat16,
                 device_map=None,
+                cache_dir=getattr(model_config, "cached_dir", None),
                 **load_kwargs,
             )
             adapter_state = None
@@ -77,23 +85,28 @@ class BayesAdaptiveLLMModel(Model):
                     base_vocab_size = base_model.get_input_embeddings().num_embeddings
                     if adapter_vocab_size != base_vocab_size:
                         base_model.resize_token_embeddings(adapter_vocab_size)
-            peft_model = PeftModel.from_pretrained(base_model, model_name)
+            peft_model = PeftModel.from_pretrained(base_model, str(model_name))
             try:
-                self.model = peft_model.merge_and_unload()
-            except Exception as exc:
-                # logger.warning("Failed to merge LoRA adapter, using PEFT wrapper directly: %s", exc)
-                self.model = peft_model
+                self.plm = peft_model.merge_and_unload()
+            except Exception:
+                self.plm = peft_model
         else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
+            self.plm = AutoModelForCausalLM.from_pretrained(
+                str(model_name),
                 trust_remote_code=trust_remote_code,
                 torch_dtype=torch.bfloat16,
                 device_map=None,
+                cache_dir=getattr(model_config, "cached_dir", None),
                 **load_kwargs,
             )
-        self.model.to(self.device)
-        self.model.eval()
-        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        # Ensure embeddings match tokenizer size after special tokens.
+        try:
+            self.plm.resize_token_embeddings(len(self.tokenizer))
+        except Exception:
+            pass
+        self.plm.to(self.device)
+        self.plm.eval()
+        self.plm.config.pad_token_id = self.tokenizer.pad_token_id
         stop_token_ids = self.tokenizer.encode(stop_symbol, add_special_tokens=False)
         self.stop_token_id = stop_token_ids[-1] if len(stop_token_ids) > 0 else self.tokenizer.eos_token_id
         self.input_max_len = input_max_len
@@ -106,8 +119,15 @@ class BayesAdaptiveLLMModel(Model):
             "num_return_sequences": 1,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.stop_token_id,
-            # "no_repeat_ngram_size": 3,
         }
+
+        # Classification head for policy logits.
+        self.n_classes = self._infer_num_actions()
+        hidden_size = getattr(self.plm.config, "hidden_size", getattr(self.plm.config, "n_embd", None))
+        if hidden_size is None and hasattr(self.plm, "get_input_embeddings"):
+            hidden_size = self.plm.get_input_embeddings().embedding_dim
+        self.drop_out = nn.Dropout(p=getattr(self.model_config, "dropout", 0.1))
+        self.out_layer = nn.Linear(hidden_size, self.n_classes)
 
     def _prepare_generation_args(self, gen_args: Dict) -> Dict:
         gen_params = {**self.inference_args}
@@ -158,7 +178,7 @@ class BayesAdaptiveLLMModel(Model):
         prompt_lines.append(f"{next_prefix} ")
         return "\n".join(prompt_lines)
 
-    def generate(self, input_text: str, **gen_args):
+    def generate_text(self, input_text: str, **gen_args):
         gen_params = self._prepare_generation_args(gen_args)
         inputs = self.tokenizer([input_text], return_tensors='pt', truncation=True, max_length=self.input_max_len)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -166,7 +186,7 @@ class BayesAdaptiveLLMModel(Model):
 
         with torch.no_grad():
             try:
-                outputs = self.model.generate(**inputs, **gen_params)
+                outputs = self.plm.generate(**inputs, **gen_params)
             except ValueError as exc:
                 msg = str(exc)
                 if "not used by the model" in msg:
@@ -177,7 +197,7 @@ class BayesAdaptiveLLMModel(Model):
                             gen_params.pop(key, None)
                             stripped_any = True
                     if stripped_any:
-                        outputs = self.model.generate(**inputs, **gen_params)
+                        outputs = self.plm.generate(**inputs, **gen_params)
                     else:
                         raise
                 else:
