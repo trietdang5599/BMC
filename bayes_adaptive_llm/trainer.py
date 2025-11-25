@@ -12,6 +12,7 @@ import random
 import warnings
 import json
 import copy
+import inspect
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -46,6 +47,29 @@ from bayes_adaptive_llm.utils import coerce_to_float, stringify_dialogue_context
 from config.constants import RECOMMENDATION, NEGOTIATION, EMOTIONAL_SUPPORT, SL_RATIO, SUCCESS_RATE, AVG_TURN, FAIRNESS, \
     TOXICITY, ITEM_FREQ, USER_REWARD, PERSUATION, P4G_GOAL2DESCRIPTION, NEGOTIATION_GOAL2DESCRIPTION, ES_CONV_GOAL2DESCRIPTION, \
     P4G_GOAL2DESCRIPTION
+
+
+def _patch_dpo_trainer_get_batch_samples() -> None:
+    """
+    Align TRL's DPOTrainer.get_batch_samples signature with newer HF Trainer which passes a device argument.
+    Some TRL versions define get_batch_samples(self, iterator, num_batches) and fail when transformers adds `device`.
+    """
+    if DPOTrainer is None:
+        return
+    try:
+        sig = inspect.signature(DPOTrainer.get_batch_samples)
+    except Exception:
+        return
+
+    if "device" in sig.parameters:
+        return
+
+    original_get_batch_samples = DPOTrainer.get_batch_samples
+
+    def _wrapped(self, iterator, num_batches, device=None):
+        return original_get_batch_samples(self, iterator, num_batches)
+
+    DPOTrainer.get_batch_samples = _wrapped
 
 
 def cuda_bf16_supported() -> bool:
@@ -426,6 +450,9 @@ class BayesAdaptiveLLMTrainer(Trainer):
         """
         if DPOTrainer is None or DPOConfig is None:
             raise ImportError("trl is required for DPO training. Install it with `pip install trl`.")
+
+        # Patch TRL DPOTrainer to accept the extra `device` arg newer transformers passes.
+        _patch_dpo_trainer_get_batch_samples()
 
         train_pref, dev_pref, _ = self.process_dataset(dataset)
 
