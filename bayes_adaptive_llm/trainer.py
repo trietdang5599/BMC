@@ -555,9 +555,19 @@ class BayesAdaptiveLLMTrainer(Trainer):
                     else:
                         preference_pairs = json.load(handle)
 
-        if not preference_pairs:
-            loguru_logger.warning("No preference pairs available for DPO training; skipping.")
+        required_keys = {"prompt", "chosen", "rejected"}
+        filtered_pairs = [row for row in preference_pairs if isinstance(row, dict) and required_keys.issubset(row)]
+        dropped = len(preference_pairs) - len(filtered_pairs)
+
+        if dropped:
+            loguru_logger.warning(
+                "Filtered out %d preference items missing required keys %s.", dropped, ", ".join(sorted(required_keys))
+            )
+
+        if not filtered_pairs:
+            loguru_logger.warning("No valid preference pairs (missing prompt/chosen/rejected); skipping DPO.")
             return
+        preference_pairs = filtered_pairs
 
         model_path = getattr(self.model_config, "dpo_model_path", getattr(self.model_config, "plm", "gpt2"))
         tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -590,8 +600,8 @@ class BayesAdaptiveLLMTrainer(Trainer):
             disable_tqdm = not self.accelerator.is_local_main_process
 
         loguru_logger.info(
-            "Starting DPO training: %d pairs, epochs=%d, batch_size=%d, lr=%.1e, beta=%.2f",
-            len(dpo_dataset),
+            "Starting DPO training: %d valid pairs, epochs=%d, batch_size=%d, lr=%.1e, beta=%.2f",
+            len(preference_pairs),
             epochs,
             batch_size,
             learning_rate,
