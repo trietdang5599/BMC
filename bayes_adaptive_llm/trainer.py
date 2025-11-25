@@ -67,6 +67,12 @@ def _patch_dpo_trainer_get_batch_samples() -> None:
     original_get_batch_samples = DPOTrainer.get_batch_samples
 
     def _wrapped(self, iterator, num_batches, device=None):
+        # Ensure model used inside TRL is the causal LM (not an accelerator wrapper/generator).
+        if hasattr(self, "_policy_model_for_dpo"):
+            try:
+                self.model = self._policy_model_for_dpo
+            except Exception:
+                pass
         return original_get_batch_samples(self, iterator, num_batches)
 
     DPOTrainer.get_batch_samples = _wrapped
@@ -519,6 +525,8 @@ class BayesAdaptiveLLMTrainer(Trainer):
             eval_dataset=eval_dataset,
             tokenizer=self.tokenizer,
         )
+        # Stash the raw causal LM so patched get_batch_samples uses it.
+        setattr(dpo_trainer, "_policy_model_for_dpo", policy_model)
 
         dpo_trainer.train()
         dpo_trainer.save_model()
