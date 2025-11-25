@@ -3,6 +3,8 @@ Utility helpers shared across the Bayes-Adaptive LLM pipeline.
 """
 
 from typing import Dict, List
+import numpy as np
+
 
 
 def stringify_dialogue_context(dialogue_context: List[Dict[str, str]]) -> str:

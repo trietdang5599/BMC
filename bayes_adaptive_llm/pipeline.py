@@ -18,6 +18,7 @@ from loguru import logger
 from base.pipeline import Pipeline
 from baselines.GDP_Zero.game import DialogGame
 from baselines.GDP_Zero.openloop_mcts import OpenLoopMCTS
+from baselines.GDP_Zero.player import LLMPlayer
 from baselines.GDP_Zero.utils import update_state_for_open_loop_mcts
 from bayes_adaptive_llm.utils import (
     sanitize_persona_description,
@@ -53,26 +54,6 @@ class PersonaDialogGame(DialogGame):
         )
         return next_state
 
-
-class _UniformMCTSPlayer:
-    """
-    Minimal player wrapper for OpenLoopMCTS.
-    Uses a uniform prior over actions and exposes id<->goal mappings.
-    """
-
-    def __init__(self, action_mapping: Dict[str, int]):
-        self.goal2id = action_mapping
-        self.id2goal = {v: k for k, v in action_mapping.items()}
-        # dialog_acts ordered by action id so preference export stays stable
-        self.dialog_acts = [goal for goal, _ in sorted(self.goal2id.items(), key=lambda kv: kv[1])]
-
-    def get_valid_moves(self, state):
-        return np.array([1 for _ in self.goal2id.keys()])
-
-    def predict(self, state) -> Tuple[np.ndarray, float]:
-        prior = np.ones(len(self.goal2id), dtype=float)
-        prior /= prior.sum()
-        return prior, 0.0
 
 
 class BayesAdaptiveLLMPipeline(Pipeline):
@@ -170,11 +151,14 @@ class BayesAdaptiveLLMPipeline(Pipeline):
         if simulators is None or len(simulators) == 0:
             raise ValueError("No simulators available for preference generation.")
 
-        # Action space
+        # Action space / player
         action_mapping = self.dataset.construct_action_mapping(
             combine=self.model_config.combined_action if not getattr(self.game_config, "is_so_game", False) else False
         )
-        player = _UniformMCTSPlayer(action_mapping)
+        # expose mapping to player via model_config for LLMPlayer compatibility
+        setattr(self.model_config, "action_mapping", action_mapping)
+        dialog_acts = [goal for goal, _ in sorted(action_mapping.items(), key=lambda kv: kv[1])]
+        player = LLMPlayer(self.game_config, action_mapping, self.model_config)
 
         # MCTS configuration
         num_MCTS_sims = getattr(self.model_config, "num_mcts_sims", 15)
@@ -192,10 +176,6 @@ class BayesAdaptiveLLMPipeline(Pipeline):
         if max_cases is not None and max_cases > 0:
             cases = cases[:max_cases]
 
-        random_seed = getattr(self.model_config, "seed", None)
-        if random_seed is not None:
-            random.seed(random_seed)
-            np.random.seed(random_seed)
 
         preference_pairs: List[Dict[str, Any]] = []
         preference_path: Optional[Path] = None
@@ -257,47 +237,43 @@ class BayesAdaptiveLLMPipeline(Pipeline):
                 next_state = dialog_game.get_next_state(state, goal)
                 sys_utt = next_state["dialogue_context"][-2]["content"]
                 user_utt = next_state["dialogue_context"][-1]["content"]
-                # _log_line(
-                #     f"[Dialog {dialog_idx} | Turn {turn}] "
-                #     f"Action={goal} | SYS: {sys_utt} | USR: {user_utt} "
-                #     f"| Persona: {persona_hint.get('description', '') if persona_hint else ''}"
-                # )
+
                 # print full history up to current turn
                 history_str = stringify_dialogue_context(next_state["dialogue_context"])
-                # _log_line(f"[Dialog {dialog_idx} | Turn {turn}] History so far:\n{history_str}")
 
                 pair = get_preference_pair(
                     action_prob,
                     state_rep,
-                    player.dialog_acts,
+                    dialog_acts,
                     valid_moves,
                     planner.realizations_Vs,
                 )
-                if pair:
-                    _, best_pair, worst_pair = pair
-                    # _log_line(
-                    #     f"[Dialog {dialog_idx} | Turn {turn}] Preference pair | "
-                    #     f"Chosen: {best_pair[0]} (V={best_pair[1]:.4f}) | "
-                    #     f"Rejected: {worst_pair[0]} (V={worst_pair[1]:.4f})"
-                    # )
-                    _log_line(
-                        f"[Dialog {dialog_idx} | Turn {turn}] History+Pref:\n{history_str}\n"
-                        f"Chosen: {best_pair[0]} (V={best_pair[1]:.4f})\n"
-                        f"Rejected: {worst_pair[0]} (V={worst_pair[1]:.4f})"
-                    )
-                    dialog_pairs.append(
-                        {
-                            "prompt": stringify_dialogue_context(state["dialogue_context"]),
-                            "chosen": best_pair[0],
-                            "rejected": worst_pair[0],
-                            "turn": turn,
-                            "action": goal,
-                            "dialog_index": dialog_idx,
-                            "system_utterance": sys_utt,
-                            "user_utterance": user_utt,
-                            "persona_hint": persona_hint or None,
-                        }
-                    )
+                if pair is None:
+                    logger.info("Not enough realizations to form preference pair; skipping turn.")
+                    state = next_state
+                    continue
+                
+                _, best_pair, worst_pair = pair
+
+                _log_line(
+                    f"[Dialog {dialog_idx} | Turn {turn}] History+Pref:\n{history_str}\n"
+                    f"Chosen: {best_pair[0]} (V={best_pair[1]:.4f})\n"
+                    f"Rejected: {worst_pair[0]} (V={worst_pair[1]:.4f})"
+                )
+
+                dialog_pairs.append(
+                    {
+                        "prompt": stringify_dialogue_context(state["dialogue_context"]),
+                        "chosen": best_pair[0],
+                        "rejected": worst_pair[0],
+                        "turn": turn,
+                        "action": goal,
+                        "dialog_index": dialog_idx,
+                        "system_utterance": sys_utt,
+                        "user_utterance": user_utt,
+                        "persona_hint": persona_hint or None,
+                    }
+                )
 
                 state = next_state
                 if dialog_game.get_dialog_ended(state) != 0:

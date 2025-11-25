@@ -45,33 +45,6 @@ class BayesAdaptiveConfig(ModelConfig):
     max_gen_tokens = 256
     max_sequence_length = 512
 
-    # Prompt scaffolds (override via YAML to customise Persuader/Persuadee wording)
-    persuader_prompt = """
-    The following is background information about Save the Children.
-    Save the Children is head-quartered in London, and they work to help fight poverty around the world.
-    Children need help in developing countries and war zones. Small donations like $1 or $2 go a long way to help.
-    The following is an example conversation between a Persuader and a Persuadee about a charity called Save the Children.
-    The Persuader is trying to persuade the Persuadee to donate to Save the Children.
-    """.strip()
-    persuader_response_instruction = (
-        "Respond politely with at least one complete sentence that advances the persuasion objective."
-    )
-    persuadee_prompt = """
-    Context:
-    - Save the Children is a global charity that provides safety, nutrition, education, and emergency relief for vulnerable children.
-    - Donations of any size (as little as $1 or $2) can meaningfully improve children’s lives in developing regions and crisis zones.
-
-    Role:
-    - You are the Persuadee. The Persuader is trying to convince you to donate to Save the Children.
-
-    Guidelines:
-    1. Evaluate each request objectively and ask for clarification when details are unclear.
-    2. Think about how the Persuader’s message resonates with your values and priorities before deciding what feels right for you.
-    3. Respond politely, using complete sentences that add substance to the conversation (never empty or meaningless).
-    4. Always respond in the format `[dialog_act] utterance`, where `dialog_act` is one of the allowed persuadee acts.
-    5. Choose the dialog act that best reflects your genuine reaction; take action `[donate]` only when sufficiently convinced.
-    """.strip()
-
     # DPO-related knobs
     dpo_beta = 0.1
     max_length = None
@@ -82,12 +55,8 @@ class BayesAdaptiveConfig(ModelConfig):
     reference_model = None
     output_dir = None
 
-    # MCTS loop for preference pair generation
-    mcts_num_evaluate = 4
-    num_mcts_sims = 15
-    max_realizations = 3
-    max_turns = 12
-    top_k_preferences = 1  # pick the highest-scoring samples to form pairs
+
+    top_k_preferences = 1  
 
     def __init__(self, params):
         super().__init__()
@@ -118,7 +87,51 @@ class BayesAdaptiveConfigForEmotionalSupport(BayesAdaptiveConfig):
 
 
 class BayesAdaptiveConfigForPersuation(BayesAdaptiveConfig):
+    # MCTS loop for preference pair generation
+    mcts_num_evaluate = 1
+    num_mcts_sims = 15
+    max_realizations = 3
+    max_turns = 12
     combined_action = False
     special_tokens_dict = pg_special_tokens_dict
-    n_goals = 14
-    n_topics = 1
+    temperature = 0.000001
+    # prompt for user-aware strategic planning for persuation
+    prompt = """
+    Context:
+    - Save the Children is a global charity that provides safety, nutrition, education, and emergency relief for vulnerable children.
+    - Donations of any size (as little as $1 or $2) can meaningfully improve children’s lives in developing regions and crisis zones.
+
+    Role:
+    - You are the Persuadee. The Persuader is trying to convince you to donate to Save the Children.
+
+    Guidelines:
+    1. Evaluate each request objectively and ask for clarification when details are unclear.
+    2. Think about how the Persuader’s message resonates with your values and priorities before deciding what feels right for you.
+    3. Respond politely, using complete sentences that add substance to the conversation (never empty or meaningless).
+    4. Always respond in the format `[dialog_act] utterance`, where `dialog_act` is one of the allowed persuadee acts.
+    5. Choose the dialog act that best reflects your genuine reaction; take action `[donate]` only when sufficiently convinced.
+    """
+    cot_prompt = """
+    The following is the conversation history: {}
+    Question: What are the mental states and future actions of the persuadee.? Answer:
+    """
+    
+    # chain of thought prompting
+    rewrite_prompt = """
+    Assume you are the expert analyst. Given the conversation history and a naive action instruction, 
+    in order to convince the persuadee to donate for charity, please revise the following naive action instruction appropriately.
+    Do not modify the action instruction entirely.
+    You answer should be in the following format: "Answer: X"
+    """
+    rewrite_prompt_cot = """
+    {}
+    Do not modify the action instruction entirely.
+    The following is the conversation history: {}
+    Here is the naive action instruction: {}
+    Question: What are the rewritten action instruction ? Answer:
+    """
+        
+    """
+    class TRIP configuration for emotional support scenario
+    """
+    pass
