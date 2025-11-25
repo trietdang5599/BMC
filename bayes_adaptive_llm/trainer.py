@@ -52,39 +52,6 @@ from config.constants import RECOMMENDATION, NEGOTIATION, EMOTIONAL_SUPPORT, SL_
     P4G_GOAL2DESCRIPTION
 
 
-def _patch_dpo_trainer_get_batch_samples() -> None:
-    """
-    Ensure TRL's DPOTrainer.get_batch_samples uses the raw causal LM (with generate) rather than
-    an accelerator wrapper / generator. Also tolerates both legacy and new signatures (with device).
-    """
-    if DPOTrainer is None:
-        return
-    try:
-        sig = inspect.signature(DPOTrainer.get_batch_samples)
-    except Exception:
-        return
-
-    original_get_batch_samples = DPOTrainer.get_batch_samples
-
-    # Preserve signature while reattaching the correct models.
-    if "device" in sig.parameters:
-        def _wrapped(self, iterator, num_batches, device=None, *args, **kwargs):
-            if hasattr(self, "_policy_model_for_dpo"):
-                self.model = getattr(self, "_policy_model_for_dpo")
-            if hasattr(self, "_reference_model_for_dpo"):
-                self.ref_model = getattr(self, "_reference_model_for_dpo")
-            return original_get_batch_samples(self, iterator, num_batches, device=device, *args, **kwargs)
-    else:
-        def _wrapped(self, iterator, num_batches, *args, **kwargs):
-            if hasattr(self, "_policy_model_for_dpo"):
-                self.model = getattr(self, "_policy_model_for_dpo")
-            if hasattr(self, "_reference_model_for_dpo"):
-                self.ref_model = getattr(self, "_reference_model_for_dpo")
-            return original_get_batch_samples(self, iterator, num_batches, *args, **kwargs)
-
-    DPOTrainer.get_batch_samples = _wrapped
-
-
 def cuda_bf16_supported() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -170,14 +137,23 @@ class PreferenceDPOTrainer:
         model_path: str,
         tokenizer,
         device: torch.device,
-        learning_rate: float = 5e-5,
+        learning_rate: float = 3e-6,
         beta: float = 0.1,
+        weight_decay: float = 0.01,
+        optim_name: str = "adamw_torch",
+        use_fp16: bool = False,
+        use_bf16: bool = False,
     ):
         self.device = device
         self.tokenizer = tokenizer
         self.beta = beta
 
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        dtype = torch.float32
+        if use_bf16 and cuda_bf16_supported():
+            dtype = torch.bfloat16
+        elif use_fp16 and torch.cuda.is_available():
+            dtype = torch.float16
+
         device_map = "auto" if torch.cuda.is_available() else None
 
         policy_model = AutoModelForCausalLM.from_pretrained(
@@ -197,7 +173,16 @@ class PreferenceDPOTrainer:
         if device_map is None:
             self.reference_model = self.reference_model.to(device)
 
-        self.optimizer = torch.optim.AdamW(self.policy_model.parameters(), lr=learning_rate)
+        opt_lower = (optim_name or "adamw_torch").lower()
+        if opt_lower in ("adamw", "adamw_torch"):
+            OptimCls = torch.optim.AdamW
+        elif opt_lower == "adam":
+            OptimCls = torch.optim.Adam
+        else:
+            OptimCls = torch.optim.AdamW
+            loguru_logger.warning("Unknown optimizer %s; defaulting to AdamW.", optim_name)
+
+        self.optimizer = OptimCls(self.policy_model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     def _ensure_padding(self, model):
         if model.config.pad_token_id is None:
@@ -576,11 +561,17 @@ class BayesAdaptiveLLMTrainer(Trainer):
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        max_length = getattr(self.model_config, "dpo_max_length", 512)
+        max_length = getattr(self.model_config, "dpo_max_length", 1024)
         batch_size = getattr(self.model_config, "dpo_batch_size", 2)
         epochs = getattr(self.model_config, "dpo_epochs", 3)
-        learning_rate = getattr(self.model_config, "dpo_learning_rate", 5e-5)
+        learning_rate = getattr(self.model_config, "dpo_learning_rate", 3e-6)
         beta = getattr(self.model_config, "dpo_beta", 0.1)
+        weight_decay = getattr(self.model_config, "dpo_weight_decay", 0.01)
+        warmup_ratio = getattr(self.model_config, "dpo_warmup_ratio", 0.0)
+        optim_name = getattr(self.model_config, "dpo_optim", "adamw_torch")
+        grad_accum = max(1, int(getattr(self.model_config, "dpo_gradient_accumulation", 1)))
+        use_fp16 = bool(getattr(self.model_config, "dpo_fp16", False))
+        use_bf16 = bool(getattr(self.model_config, "dpo_bf16", False))
 
         dpo_dataset = PreferenceDPODataset(preference_pairs, tokenizer, max_length=max_length)
         dataloader = DataLoader(
@@ -596,6 +587,10 @@ class BayesAdaptiveLLMTrainer(Trainer):
             device=device,
             learning_rate=learning_rate,
             beta=beta,
+            weight_decay=weight_decay,
+            optim_name=optim_name,
+            use_fp16=use_fp16,
+            use_bf16=use_bf16,
         )
 
         disable_tqdm = False
@@ -603,21 +598,42 @@ class BayesAdaptiveLLMTrainer(Trainer):
             disable_tqdm = not self.accelerator.is_local_main_process
 
         loguru_logger.info(
-            "Starting DPO training: %d valid pairs, epochs=%d, batch_size=%d, lr=%.1e, beta=%.2f",
+            "Starting DPO training: %d valid pairs, epochs=%d, batch_size=%d, lr=%.1e, beta=%.2f, grad_accum=%d, optim=%s",
             len(preference_pairs),
             epochs,
             batch_size,
             learning_rate,
             beta,
+            grad_accum,
+            optim_name,
         )
+
+        total_steps = math.ceil(len(dataloader) / grad_accum) * epochs
+        warmup_steps = int(total_steps * warmup_ratio)
+        scheduler = None
+        if warmup_steps > 0:
+            scheduler = get_linear_schedule_with_warmup(
+                dpo_trainer.optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+            )
 
         for epoch in range(epochs):
             step_losses: List[float] = []
             progress = tqdm.tqdm(dataloader, disable=disable_tqdm, desc=f"DPO epoch {epoch+1}/{epochs}")
-            for batch in progress:
-                loss = dpo_trainer.train_step(batch)
-                step_losses.append(loss)
-                progress.set_postfix(loss=loss)
+            dpo_trainer.policy_model.train()
+            dpo_trainer.optimizer.zero_grad()
+
+            for step_idx, batch in enumerate(progress):
+                loss = dpo_trainer.dpo_loss(batch) / grad_accum
+                loss.backward()
+
+                if (step_idx + 1) % grad_accum == 0 or step_idx == len(dataloader) - 1:
+                    dpo_trainer.optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    dpo_trainer.optimizer.zero_grad()
+
+                step_losses.append(float(loss.item()) * grad_accum)
+                progress.set_postfix(loss=step_losses[-1])
 
             avg_loss = float(np.mean(step_losses)) if step_losses else 0.0
             loguru_logger.info("Epoch %d completed. Avg loss: %.4f", epoch + 1, avg_loss)

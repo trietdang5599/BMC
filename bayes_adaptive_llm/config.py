@@ -42,6 +42,10 @@ class BayesAdaptiveConfig(ModelConfig):
     logging_steps = 10
     save_total_limit = 2
     max_grad_norm = 1.0
+    warmup_ratio = 0.05
+    optim = "adamw_torch"
+    fp16 = False
+    bf16 = True
 
     # inference / prompting
     temperature = 0.7
@@ -57,10 +61,14 @@ class BayesAdaptiveConfig(ModelConfig):
     dpo_learning_rate = 5e-5
     dpo_max_length = 512
     dpo_use_wandb = False
+    dpo_weight_decay = 0.01
+    dpo_warmup_ratio = 0.05
+    dpo_fp16 = False
+    dpo_bf16 = True
+    dpo_optim = "adamw_torch"   
+    dpo_gradient_accumulation = 16
     max_length = None
     max_prompt_length = None
-    fp16 = False
-    bf16 = False
     gradient_checkpointing = False
     reference_model = None
     output_dir = None
